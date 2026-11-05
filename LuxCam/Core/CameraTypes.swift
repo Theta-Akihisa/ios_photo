@@ -88,17 +88,33 @@ struct ManualSettings: Equatable {
 // MARK: - Video recording formats
 
 enum VideoCodecOption: String, CaseIterable, Identifiable {
-    case hevc, proRes422HQ, proResRAW, proResRAWHQ
+    case hevc, proRes422HQ, proRes422, proRes422LT, proRes422Proxy, proResRAW, proResRAWHQ
     var id: String { rawValue }
     var title: String {
         switch self {
         case .hevc: return "HEVC"
         case .proRes422HQ: return "ProRes 422 HQ"
+        case .proRes422: return "ProRes 422"
+        case .proRes422LT: return "ProRes 422 LT"
+        case .proRes422Proxy: return "ProRes 422 Proxy"
         case .proResRAW: return "ProRes RAW"
         case .proResRAWHQ: return "ProRes RAW HQ"
         }
     }
     var isRAW: Bool { self == .proResRAW || self == .proResRAWHQ }
+    var isProRes: Bool { self != .hevc }
+    /// AVFoundation codec type. RAW uses raw FourCCs so we never reference symbols missing in older SDKs.
+    var avCodecType: AVVideoCodecType {
+        switch self {
+        case .hevc: return .hevc
+        case .proRes422HQ: return .proRes422HQ
+        case .proRes422: return .proRes422
+        case .proRes422LT: return .proRes422LT
+        case .proRes422Proxy: return .proRes422Proxy
+        case .proResRAW: return AVVideoCodecType(rawValue: "aprn")
+        case .proResRAWHQ: return AVVideoCodecType(rawValue: "aprh")
+        }
+    }
 }
 
 enum VideoColorProfile: String, CaseIterable, Identifiable {
@@ -117,17 +133,31 @@ struct VideoFormatSettings: Equatable {
     var codec: VideoCodecOption = .hevc
     var color: VideoColorProfile = .standard
     var resolution4K: Bool = true
-    var frameRate: Int = 30
-    /// When true, the selected look is rendered into the recorded file (AVAssetWriter path).
-    /// RAW / ProRes / Log keep the source untouched and store the look name as metadata only.
-    var bakesLook: Bool { codec == .hevc && color != .appleLog }
+    var frameRate: Int = 30                 // 24 / 25 / 30 / 60 / 120
+    /// When true, the selected look is rendered into the recorded file (AVAssetWriter, 8-bit SDR HEVC).
+    /// HDR / RAW / ProRes / Log keep the source untouched and store the look name as metadata only.
+    var bakesLook: Bool { codec == .hevc && color == .standard }
+}
+
+// MARK: - Photo formats
+
+enum PhotoFormat: String, CaseIterable, Identifiable {
+    case heif, proRAW
+    var id: String { rawValue }
+    var title: String { self == .heif ? "HEIF" : "ProRAW" }
 }
 
 // MARK: - Capabilities
 
 struct DeviceCapabilities: Equatable {
-    var proRes422HQ = false
-    var proResRAW = false
+    /// Codecs usable with the current device/format (always contains .hevc).
+    var supportedCodecs: Set<VideoCodecOption> = [.hevc]
+    /// Frame rates (from 24/25/30/60/120) the device supports at the selected resolution.
+    var supportedFrameRates: [Int] = [24, 25, 30, 60]
+    /// Apple ProRAW still capture (iPhone 12 Pro and later Pro models).
+    var proRAW = false
+    var proRes422HQ: Bool { supportedCodecs.contains(.proRes422HQ) }
+    var proResRAW: Bool { supportedCodecs.contains(.proResRAW) }
     var appleLog = false
     var hlg = false
     var cinematic = false
@@ -145,6 +175,7 @@ struct CameraState: Equatable {
     var look: LookPreset = .native
     var manual = ManualSettings()
     var video = VideoFormatSettings()
+    var photoFormat: PhotoFormat = .heif
     var capabilities = DeviceCapabilities()
     /// Simulated aperture (f-number) for PORTRAIT / CINEMATIC.
     var simulatedAperture: Float = 2.8

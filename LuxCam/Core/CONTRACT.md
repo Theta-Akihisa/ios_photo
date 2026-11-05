@@ -16,6 +16,7 @@ final class CameraService: NSObject, ObservableObject {
     func set(look: LookPreset)
     func set(manual: ManualSettings)
     func set(video: VideoFormatSettings)
+    func set(photoFormat: PhotoFormat)      // HEIF or Apple ProRAW (DNG); ProRAW ignores looks
     func set(simulatedAperture: Float)
     func focus(at devicePoint: CGPoint)     // point of interest in device coordinates (0...1), resets focus to auto
     func capturePhoto()
