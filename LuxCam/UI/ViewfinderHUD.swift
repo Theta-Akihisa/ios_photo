@@ -25,6 +25,13 @@ struct TopBarView: View {
             HStack {
                 Spacer()
                 if state.mode.isVideo { videoInfo }
+                else if state.mode == .photo && state.photoFormat == .proRAW {
+                    Text("RAW")
+                        .font(Theme.mono(10, .semibold))
+                        .foregroundStyle(Theme.red)
+                        .padding(.horizontal, 5).padding(.vertical, 2)
+                        .overlay(Rectangle().stroke(Theme.red, lineWidth: 0.5))
+                }
             }
         }
         .padding(.horizontal, Theme.gutter)

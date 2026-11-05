@@ -4,7 +4,7 @@
 import SwiftUI
 
 enum ManualChip: String, Identifiable {
-    case focus, shutter, iso, ev, look, aperture, format
+    case focus, shutter, iso, ev, look, aperture, format, photoFormat
     var id: String { rawValue }
 }
 
@@ -55,6 +55,7 @@ struct ManualControlsView: View {
         list.append(.look)
         if state.mode == .portrait || state.mode == .cinematic { list.append(.aperture) }
         if state.mode.isVideo { list.append(.format) }
+        if state.mode == .photo { list.append(.photoFormat) }
         return list
     }
 
@@ -104,6 +105,7 @@ struct ManualControlsView: View {
         case .look: return "LOOK"
         case .aperture: return "APERTURE"
         case .format: return "FORMAT"
+        case .photoFormat: return "PHOTO"
         }
     }
 
@@ -122,6 +124,7 @@ struct ManualControlsView: View {
         case .look: return state.look.title
         case .aperture: return Fmt.aperture(state.simulatedAperture)
         case .format: return state.video.resolution4K ? "4K" : "HD"
+        case .photoFormat: return state.photoFormat.title
         }
     }
 
@@ -152,6 +155,38 @@ struct ManualControlsView: View {
         case .look: LookPickerView(camera: camera)
         case .aperture: apertureDial
         case .format: EmptyView()
+        case .photoFormat: photoFormatPicker
+        }
+    }
+
+    private var photoFormatPicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 0) {
+                ForEach(PhotoFormat.allCases) { f in
+                    let ok = f == .heif || state.capabilities.proRAW
+                    let isOn = state.photoFormat == f
+                    Button {
+                        camera.set(photoFormat: f)
+                    } label: {
+                        VStack(spacing: 4) {
+                            Text(f.title).font(Theme.mono(14, isOn ? .semibold : .regular))
+                            Text(ok ? " " : "非対応").font(.system(size: 9))
+                            Rectangle().fill(isOn ? Theme.red : Color.clear).frame(height: 2)
+                        }
+                        .foregroundStyle(ok ? (isOn ? Theme.text : Theme.dim) : Theme.faint)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!ok)
+                }
+            }
+            if state.photoFormat == .proRAW {
+                Text("ProRAW: DNG を同時保存（ルックはHEIFのみに適用）")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.dim)
+            }
         }
     }
 

@@ -12,8 +12,7 @@ struct ContentView: View {
             Theme.black.ignoresSafeArea()
             CameraScreen(camera: camera)
         }
-        .onAppear { camera.start() }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase, initial: true) { _, phase in
             switch phase {
             case .active: camera.start()
             case .background: camera.stop()

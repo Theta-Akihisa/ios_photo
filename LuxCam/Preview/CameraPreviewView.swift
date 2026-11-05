@@ -23,6 +23,11 @@ struct CameraPreviewView: UIViewRepresentable {
         self.onTapViewPoint = onTapViewPoint
     }
 
+    /// Set to true if the preview appears upside down on device.
+    /// `CIContext.render(_:to: MTLTexture, ...)` is expected to map Core Image's bottom-left origin
+    /// so upright CIImages display upright, hence no explicit flip by default. Tap mapping follows this flag.
+    private static let flipVertically = false
+
     func makeCoordinator() -> Coordinator {
         Coordinator(frames: frames, look: look, renderer: renderer,
                     onTap: onTap, onTapViewPoint: onTapViewPoint)
@@ -115,15 +120,19 @@ struct CameraPreviewView: UIViewRepresentable {
             }
 
             // Sensor frames are landscape-right; rotate for portrait UI.
-            let source = CIImage(cvPixelBuffer: buffer).oriented(.right)
+            // Apple Log frames: disable colour management so Core Image does not linearise them
+            // before the Log monitoring cube is applied.
+            let base = isLog
+                ? CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
+                : CIImage(cvPixelBuffer: buffer)
+            let source = base.oriented(.right)
             let looked = renderer.apply(currentLook, to: source, isLogSource: isLog)
 
             let extent = source.extent // the look must not change geometry; use source extent
             guard extent.width > 0, extent.height > 0 else { return }
             orientedSize = extent.size
 
-            // Aspect-fill: move origin to 0, scale to cover, center, then flip Y
-            // (CIImage is bottom-left origin, Metal texture is top-left).
+            // Aspect-fill: move origin to 0, scale to cover, center (optionally flipping Y, see flipVertically).
             let scale = max(size.width / extent.width, size.height / extent.height)
             let scaledW = extent.width * scale
             let scaledH = extent.height * scale
@@ -132,9 +141,10 @@ struct CameraPreviewView: UIViewRepresentable {
             var t = CGAffineTransform(translationX: -extent.origin.x, y: -extent.origin.y)
             t = t.concatenating(CGAffineTransform(scaleX: scale, y: scale))
             t = t.concatenating(CGAffineTransform(translationX: tx, y: ty))
-            // Vertical flip within the drawable.
-            t = t.concatenating(CGAffineTransform(scaleX: 1, y: -1))
-            t = t.concatenating(CGAffineTransform(translationX: 0, y: size.height))
+            if CameraPreviewView.flipVertically {
+                t = t.concatenating(CGAffineTransform(scaleX: 1, y: -1))
+                t = t.concatenating(CGAffineTransform(translationX: 0, y: size.height))
+            }
 
             let bounds = CGRect(origin: .zero, size: size)
             let output = looked.transformed(by: t).cropped(to: bounds)
@@ -168,7 +178,8 @@ struct CameraPreviewView: UIViewRepresentable {
             let offX = (b.width - dispW) / 2, offY = (b.height - dispH) / 2
 
             let xNorm = min(max((p.x - offX) / dispW, 0), 1)
-            let yNorm = min(max((p.y - offY) / dispH, 0), 1)
+            var yNorm = min(max((p.y - offY) / dispH, 0), 1)
+            if CameraPreviewView.flipVertically { yNorm = 1 - yNorm } // image is drawn flipped
 
             // Oriented-right portrait -> landscape-right sensor point of interest.
             let device = CGPoint(x: yNorm, y: 1 - xNorm)

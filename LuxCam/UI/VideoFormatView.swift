@@ -16,12 +16,13 @@ struct VideoFormatView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     header
+                    presetButton
                     section("CODEC") { codecList }
                     section("COLOR") { colorRow }
                     section("RESOLUTION") { resolutionRow }
                     section("FPS") { fpsRow }
                     if !video.bakesLook {
-                        Text("RAW / LOG / ProRes ではルックはプレビューのみ（メタデータに記録）")
+                        Text("HDR / LOG / ProRes / RAW ではルックはプレビューのみ（メタデータに記録）")
                             .font(.system(size: 12))
                             .foregroundStyle(Theme.dim)
                             .padding(.top, 4)
@@ -61,10 +62,38 @@ struct VideoFormatView: View {
     // MARK: Support checks
 
     private func isSupported(_ codec: VideoCodecOption) -> Bool {
-        switch codec {
-        case .hevc: return true
-        case .proRes422HQ: return caps.proRes422HQ
-        case .proResRAW, .proResRAWHQ: return caps.proResRAW
+        caps.supportedCodecs.contains(codec)
+    }
+
+    private var canApplyRecommended: Bool {
+        caps.supportedCodecs.contains(.proRes422HQ) && caps.appleLog && caps.supportedFrameRates.contains(30)
+    }
+
+    private var presetButton: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                update {
+                    $0.codec = .proRes422HQ
+                    $0.color = .appleLog
+                    $0.resolution4K = true
+                    $0.frameRate = 30
+                }
+            } label: {
+                HStack {
+                    Text("おすすめ (iPhone 16 Pro)").font(.system(size: 13, weight: .medium))
+                    Spacer()
+                    Text("ProRes 422 HQ · LOG · 4K · 30").font(Theme.mono(10))
+                }
+                .foregroundStyle(canApplyRecommended ? Theme.text : Theme.faint)
+                .padding(12)
+                .overlay(Rectangle().stroke(canApplyRecommended ? Theme.red : Theme.hairline, lineWidth: 0.5))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!canApplyRecommended)
+            Text("iPhone 16 Pro では ProRes RAW 非対応のため、ProRes 422 HQ + Apple Log が最もグレーディング耐性の高い設定です。4K60/120 の ProRes は外部 SSD が必要な場合があります。")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.dim)
         }
     }
 
@@ -85,29 +114,48 @@ struct VideoFormatView: View {
     // MARK: Sections
 
     private var codecList: some View {
-        VStack(spacing: 0) {
-            ForEach(VideoCodecOption.allCases) { codec in
-                let ok = isSupported(codec)
-                Button {
-                    update { $0.codec = codec }
-                } label: {
-                    HStack {
-                        Text(codec.title).font(Theme.mono(14, video.codec == codec ? .semibold : .regular))
-                        Spacer()
-                        if !ok {
-                            Text("非対応").font(.system(size: 11))
-                        } else if video.codec == codec {
-                            RedDot(size: 7)
-                        }
-                    }
-                    .foregroundStyle(ok ? (video.codec == codec ? Theme.text : Theme.dim) : Theme.faint)
-                    .padding(.vertical, 12)
-                    .contentShape(Rectangle())
+        VStack(alignment: .leading, spacing: 0) {
+            codecGroup("HEVC", [.hevc])
+            codecGroup("ProRes", [.proRes422HQ, .proRes422, .proRes422LT, .proRes422Proxy])
+            codecGroup("RAW", [.proResRAW, .proResRAWHQ], caption: "iPhone 17 Pro 以降")
+        }
+    }
+
+    private func codecGroup(_ title: String, _ codecs: [VideoCodecOption], caption: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Text(title).luxCaps(9, color: Theme.dim)
+                if let caption {
+                    Text(caption).font(.system(size: 10)).foregroundStyle(Theme.faint)
                 }
-                .buttonStyle(.plain)
-                .disabled(!ok)
-                Hairline()
             }
+            .padding(.top, 10).padding(.bottom, 2)
+            ForEach(codecs) { codec in codecRow(codec) }
+        }
+    }
+
+    private func codecRow(_ codec: VideoCodecOption) -> some View {
+        let ok = isSupported(codec)
+        return VStack(spacing: 0) {
+            Button {
+                update { $0.codec = codec }
+            } label: {
+                HStack {
+                    Text(codec.title).font(Theme.mono(14, video.codec == codec ? .semibold : .regular))
+                    Spacer()
+                    if !ok {
+                        Text("非対応").font(.system(size: 11))
+                    } else if video.codec == codec {
+                        RedDot(size: 7)
+                    }
+                }
+                .foregroundStyle(ok ? (video.codec == codec ? Theme.text : Theme.dim) : Theme.faint)
+                .padding(.vertical, 12)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!ok)
+            Hairline()
         }
     }
 
@@ -122,8 +170,8 @@ struct VideoFormatView: View {
     }
 
     private var fpsRow: some View {
-        segmented([24, 25, 30, 60], selected: video.frameRate,
-                  title: { "\($0)" }, enabled: { _ in true }) { f in update { $0.frameRate = f } }
+        segmented([24, 25, 30, 60, 120], selected: video.frameRate,
+                  title: { "\($0)" }, enabled: { caps.supportedFrameRates.contains($0) }) { f in update { $0.frameRate = f } }
     }
 
     /// Equal-width option row with a red underline on the selected item.
