@@ -3,6 +3,7 @@
 
 import AVFoundation
 import CoreImage
+import CoreImage.CIFilterBuiltins
 import ImageIO
 import UIKit
 
@@ -53,18 +54,18 @@ final class PhotoProcessor {
 
     private func depthBlur(data: Data, base: CIImage, aperture: Float) -> CIImage? {
         guard let disparity = CIImage(data: data, options: [.auxiliaryDisparity: true,
-                                                            .applyOrientationProperty: true]),
-              let filter = CIFilter(name: "CIDepthBlurEffect") else { return nil }
+                                                            .applyOrientationProperty: true]) else { return nil }
         let target = base.extent
 
-        filter.setValue(base, forKey: kCIInputImageKey)
-        filter.setValue(fit(disparity, to: target), forKey: "inputDisparityImage")
+        let filter = CIFilter.depthBlurEffect()
+        filter.inputImage = base
+        filter.disparityImage = fit(disparity, to: target)
         if let matte = CIImage(data: data, options: [.auxiliaryPortraitEffectsMatte: true,
                                                      .applyOrientationProperty: true]) {
-            filter.setValue(fit(matte, to: target), forKey: "inputMatteImage")
+            filter.matteImage = fit(matte, to: target)
         }
-        filter.setValue(NSNumber(value: aperture), forKey: "inputAperture")
-        filter.setValue(NSNumber(value: 1.0), forKey: "inputScale")
+        filter.aperture = aperture
+        filter.scaleFactor = 1.0
         return filter.outputImage
     }
 

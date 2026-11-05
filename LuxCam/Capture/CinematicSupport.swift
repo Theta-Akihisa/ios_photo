@@ -43,8 +43,18 @@ enum CinematicSupport {
     @discardableResult
     static func setAperture(_ aperture: Float, input: AVCaptureDeviceInput, device: AVCaptureDevice) -> Bool {
         guard #available(iOS 26.0, *) else { return false }
-        if setValueIfSupported(input, key: "simulatedAperture", value: aperture) { return true }
-        return setValueIfSupported(device, key: "simulatedAperture", value: aperture)
+        var value = aperture
+        let format = device.activeFormat
+        if format.responds(to: NSSelectorFromString("minSimulatedAperture")),
+           let lo = (format.value(forKey: "minSimulatedAperture") as? NSNumber)?.floatValue, lo > 0 {
+            value = max(value, lo)
+        }
+        if format.responds(to: NSSelectorFromString("maxSimulatedAperture")),
+           let hi = (format.value(forKey: "maxSimulatedAperture") as? NSNumber)?.floatValue, hi > 0 {
+            value = min(value, hi)
+        }
+        if setValueIfSupported(input, key: "simulatedAperture", value: value) { return true }
+        return setValueIfSupported(device, key: "simulatedAperture", value: value)
     }
 
     // MARK: KVC helper

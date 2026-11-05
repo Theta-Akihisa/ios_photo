@@ -8,10 +8,16 @@ import UIKit
 
 enum LibrarySaver {
 
-    static func savePhoto(data: Data, completion: @escaping (Bool, Error?) -> Void) {
+    /// Saves `data` as the primary photo; `rawDNG` (Apple ProRAW) is stored as the alternate resource.
+    static func savePhoto(data: Data, rawDNG: Data? = nil, completion: @escaping (Bool, Error?) -> Void) {
         PHPhotoLibrary.shared().performChanges({
             let request = PHAssetCreationRequest.forAsset()
             request.addResource(with: .photo, data: data, options: PHAssetResourceCreationOptions())
+            if let raw = rawDNG {
+                let rawOptions = PHAssetResourceCreationOptions()
+                rawOptions.uniformTypeIdentifier = "com.adobe.raw-image"
+                request.addResource(with: .alternatePhoto, data: raw, options: rawOptions)
+            }
         }, completionHandler: { ok, error in
             completion(ok, error)
         })
@@ -49,7 +55,15 @@ enum LibrarySaver {
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: maxPixel, height: maxPixel)
-        guard let cg = try? generator.copyCGImage(at: .zero, actualTime: nil) else { return nil }
+        final class Box: @unchecked Sendable { var image: CGImage? }
+        let box = Box()
+        let semaphore = DispatchSemaphore(value: 0)
+        generator.generateCGImageAsynchronously(for: .zero) { image, _, _ in
+            box.image = image
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let cg = box.image else { return nil }
         return UIImage(cgImage: cg)
     }
 }

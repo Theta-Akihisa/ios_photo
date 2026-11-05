@@ -124,7 +124,10 @@ final class MovieRecorder {
         CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out)
         guard let dst = out else { return }
 
-        var image = CIImage(cvPixelBuffer: pixelBuffer)
+        // Apple Log frames must not be linearised by Core Image before the Log cube runs.
+        var image = isLog
+            ? CIImage(cvPixelBuffer: pixelBuffer, options: [.colorSpace: NSNull()])
+            : CIImage(cvPixelBuffer: pixelBuffer)
         let extent = image.extent
         if look != .native || isLog {
             image = renderer.apply(look, to: image, isLogSource: isLog)

@@ -57,22 +57,53 @@ enum CaptureFormats {
         device.formats.contains { supports($0, colorSpace: cs) }
     }
 
-    static func is10Bit(_ f: AVCaptureDevice.Format) -> Bool {
-        let sub = CMFormatDescriptionGetMediaSubType(f.formatDescription)
+    static func subType(_ f: AVCaptureDevice.Format) -> FourCharCode {
+        CMFormatDescriptionGetMediaSubType(f.formatDescription)
+    }
+
+    /// 10-bit 4:2:0 ('x420' / 'xf20').
+    static func is10Bit420(_ f: AVCaptureDevice.Format) -> Bool {
+        let sub = subType(f)
         return sub == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             || sub == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
     }
 
-    /// Heuristic: any media subtype that is not a plain YpCbCr 4:2:0 layout is treated as a RAW/Bayer format.
+    /// 10-bit 4:2:2 ('x422' / 'xf22'), the layout ProRes 422 records from.
+    static func is10Bit422(_ f: AVCaptureDevice.Format) -> Bool {
+        let sub = subType(f)
+        return sub == kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
+            || sub == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange
+    }
+
+    static func is10Bit(_ f: AVCaptureDevice.Format) -> Bool {
+        is10Bit420(f) || is10Bit422(f)
+    }
+
+    /// Heuristic: any media subtype that is not a plain YpCbCr layout (8-bit 4:2:0, 10-bit 4:2:0 / 4:2:2)
+    /// is treated as a RAW/Bayer format.
     static func looksRAW(_ f: AVCaptureDevice.Format) -> Bool {
-        let sub = CMFormatDescriptionGetMediaSubType(f.formatDescription)
+        let sub = subType(f)
         let yuv: [FourCharCode] = [
             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
             kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-            kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+            kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+            kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
+            kCVPixelFormatType_422YpCbCr10BiPlanarFullRange
         ]
         return !yuv.contains(sub)
+    }
+
+    static func matchesResolution(_ f: AVCaptureDevice.Format, is4K: Bool) -> Bool {
+        let d = dimensions(f)
+        return is4K ? (d.w >= 3840 && d.w <= 4096) : (d.w == 1920)
+    }
+
+    /// Frame rates (subset of 24/25/30/60/120) available at the chosen resolution on non-RAW formats.
+    static func supportedFrameRates(of device: AVCaptureDevice, resolution4K: Bool) -> [Int] {
+        let formats = device.formats.filter { !looksRAW($0) && matchesResolution($0, is4K: resolution4K) }
+        let rates = [24, 25, 30, 60, 120].filter { r in formats.contains { supportsFPS($0, Double(r)) } }
+        return rates.isEmpty ? [24, 25, 30] : rates
     }
 
     // MARK: Video format selection
@@ -96,6 +127,12 @@ enum CaptureFormats {
         func score(_ f: AVCaptureDevice.Format) -> Int {
             var s = 0
             if looksRAW(f) == wantRAW { s += 100 }
+            if settings.codec.isProRes && !wantRAW {
+                // ProRes 422 records from 10-bit 4:2:2 sources.
+                if is10Bit422(f) { s += 50 }
+            } else if is10Bit422(f) {
+                s -= 5
+            }
             if is10Bit(f) { s += 10 }
             return s
         }
@@ -104,9 +141,7 @@ enum CaptureFormats {
             let list = device.formats.filter { f in
                 if let cs = cs, !supports(f, colorSpace: cs) { return false }
                 if requireRes {
-                    let d = dimensions(f)
-                    let ok = settings.resolution4K ? (d.w >= 3840 && d.w <= 4096) : (d.w == 1920)
-                    if !ok { return false }
+                    if !matchesResolution(f, is4K: settings.resolution4K) { return false }
                 }
                 if requireFPS && !supportsFPS(f, fps) { return false }
                 return true
@@ -118,6 +153,16 @@ enum CaptureFormats {
             ?? pick(requireFPS: false, requireRes: true)
             ?? pick(requireFPS: true, requireRes: false)
             ?? pick(requireFPS: false, requireRes: false)
+    }
+
+    /// Describes how `format` deviates from the requested resolution / frame rate (nil when it matches).
+    static func mismatchNote(_ f: AVCaptureDevice.Format, settings: VideoFormatSettings) -> String? {
+        let resOK = matchesResolution(f, is4K: settings.resolution4K)
+        let fpsOK = supportsFPS(f, Double(settings.frameRate))
+        if resOK && fpsOK { return nil }
+        let d = dimensions(f)
+        let actualFPS = Int(clampedFPS(f, Double(settings.frameRate)).rounded())
+        return "指定の組み合わせは利用できないため、最も近い設定（\(d.w)x\(d.h) / \(actualFPS)fps）を使用します"
     }
 
     // MARK: Misc

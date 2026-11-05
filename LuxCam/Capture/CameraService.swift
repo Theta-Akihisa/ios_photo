@@ -30,12 +30,14 @@ private enum RecordingPhase { case idle, recording, finalizing }
 private enum RecordingKind { case baked(MovieRecorder), movieFile }
 
 /// Per-capture delegate; collects the file data and reports once the capture is complete.
+/// For Apple ProRAW the delegate receives two photos (DNG + processed); both are kept.
 private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
     private var data: Data?
+    private var rawData: Data?
     private var captureError: Error?
-    private let completion: (Data?, Error?) -> Void
+    private let completion: (Data?, Data?, Error?) -> Void
 
-    init(completion: @escaping (Data?, Error?) -> Void) {
+    init(completion: @escaping (Data?, Data?, Error?) -> Void) {
         self.completion = completion
         super.init()
     }
@@ -45,13 +47,17 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
             captureError = error
             return
         }
-        data = photo.fileDataRepresentation()
+        if photo.isRawPhoto {
+            rawData = photo.fileDataRepresentation()
+        } else {
+            data = photo.fileDataRepresentation()
+        }
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings,
                      error: Error?) {
-        completion(data, captureError ?? error)
+        completion(data, rawData, captureError ?? error)
     }
 }
 
@@ -90,6 +96,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     private var phase: RecordingPhase = .idle
     private var recordingKind: RecordingKind?
     private var runtimeObserver: NSObjectProtocol?
+    private var stopAfterRecording = false
 
     /// Configuration mirror used on sessionQueue.
     private struct QueueConfig {
@@ -98,6 +105,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         var manual = ManualSettings()
         var video = VideoFormatSettings()
         var aperture: Float = 2.8
+        var photoFormat: PhotoFormat = .heif
         /// Video settings actually applied (cinematic overrides, colour fallbacks).
         var effective = VideoFormatSettings()
     }
@@ -148,13 +156,22 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                     self.publishError("Camera access is denied. Enable it in Settings > Privacy.")
                     return
                 }
+                let alreadyRunning = self.session.isRunning && self.videoInput != nil
+                    && !self.pendingReconfigure
+                self.wantsRunning = true
+                self.stopAfterRecording = false
+                if alreadyRunning {
+                    // onAppear + scenePhase can both call start(); don't reconfigure twice.
+                    self.publishRunning()
+                    return
+                }
                 self.q.mode = snapshot.mode
                 self.q.look = snapshot.look
                 self.q.manual = snapshot.manual
                 self.q.video = snapshot.video
                 self.q.aperture = snapshot.simulatedAperture
+                self.q.photoFormat = snapshot.photoFormat
                 self.shared.setLook(snapshot.look)
-                self.wantsRunning = true
                 self.reconfigure()
                 if !self.session.isRunning { self.session.startRunning() }
                 self.publishRunning()
@@ -165,7 +182,12 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     func stop() {
         sessionQueue.async { [self] in
             wantsRunning = false
-            if phase == .recording { stopRecordingOnQueue() }
+            if phase != .idle {
+                // Let the recording finalise first; the session is stopped in finishRecordingCleanup().
+                stopAfterRecording = true
+                if phase == .recording { stopRecordingOnQueue() }
+                return
+            }
             if session.isRunning { session.stopRunning() }
             publishRunning()
         }
@@ -200,6 +222,15 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         sessionQueue.async { [self] in
             q.video = video
             if q.mode == .video { reconfigure() }
+        }
+    }
+
+    func set(photoFormat: PhotoFormat) {
+        guard photoFormat != state.photoFormat else { return }
+        state.photoFormat = photoFormat
+        sessionQueue.async { [self] in
+            q.photoFormat = photoFormat
+            if q.mode == .photo { reconfigure() }
         }
     }
 
@@ -259,8 +290,8 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             }
             let settings = makePhotoSettings(mode: mode)
             let id = settings.uniqueID
-            let delegate = PhotoCaptureDelegate { [weak self] data, error in
-                self?.photoCaptureFinished(id: id, data: data, error: error,
+            let delegate = PhotoCaptureDelegate { [weak self] data, rawData, error in
+                self?.photoCaptureFinished(id: id, data: data, rawData: rawData, error: error,
                                            mode: mode, look: look, aperture: aperture)
             }
             inflightPhotos[id] = delegate
@@ -388,6 +419,9 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             }
             if let fmt = format {
                 isLog = applyFormat(fmt, to: dev, settings: effective)
+                if mode == .video, let note = CaptureFormats.mismatchNote(fmt, settings: effective) {
+                    publishError(note)
+                }
             }
             if cinematicActive {
                 let ok = CinematicSupport.setEnabled(true, input: input, device: dev)
@@ -404,6 +438,13 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             if session.canSetSessionPreset(.photo) { session.sessionPreset = .photo }
             session.automaticallyConfiguresCaptureDeviceForWideColor = true
             if session.canAddOutput(photoOutput) { session.addOutput(photoOutput) }
+            // Apple ProRAW must be switched on while the session is being configured.
+            let proRAWSupported = session.outputs.contains(photoOutput) && photoOutput.isAppleProRAWSupported
+            if proRAWSupported { knownCaps.proRAW = true }
+            let wantProRAW = proRAWSupported && mode == .photo && q.photoFormat == .proRAW
+            if photoOutput.isAppleProRAWEnabled != wantProRAW {
+                photoOutput.isAppleProRAWEnabled = wantProRAW
+            }
         }
 
         q.effective = effective
@@ -467,12 +508,14 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         if photoOutput.isPortraitEffectsMatteDeliverySupported {
             photoOutput.isPortraitEffectsMatteDeliveryEnabled = portrait && photoOutput.isDepthDataDeliveryEnabled
         }
-        // Make sure a previous Log / HLG selection does not leak into photo mode.
-        if dev.activeColorSpace != .sRGB, CaptureFormats.supports(dev.activeFormat, colorSpace: .sRGB),
-           (try? dev.lockForConfiguration()) != nil {
-            dev.activeColorSpace = .sRGB
-            dev.unlockForConfiguration()
+        // Largest (e.g. 48 MP) output in PHOTO mode; PORTRAIT stays at the smallest size (depth limits).
+        let dims = dev.activeFormat.supportedMaxPhotoDimensions
+        func area(_ d: CMVideoDimensions) -> Int { Int(d.width) * Int(d.height) }
+        let pick = portrait ? dims.min(by: { area($0) < area($1) }) : dims.max(by: { area($0) < area($1) })
+        if let pick = pick, area(pick) > 0 {
+            photoOutput.maxPhotoDimensions = pick
         }
+        // Wide colour stays automatic in photo mode (session.automaticallyConfiguresCaptureDeviceForWideColor).
     }
 
     private func configureMovieOutput(effective: VideoFormatSettings) {
@@ -481,28 +524,27 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         if conn.isVideoRotationAngleSupported(90) { conn.videoRotationAngle = 90 }
 
         let available = movieOutput.availableVideoCodecTypes
-        let rawCodec = AVVideoCodecType(rawValue: "aprn")
-        let rawHQCodec = AVVideoCodecType(rawValue: "aprh")
+        var supported = Set(VideoCodecOption.allCases.filter { available.contains($0.avCodecType) })
+        supported.insert(.hevc)
+        knownCaps.supportedCodecs = supported
 
+        // HLG records as 10-bit HDR HEVC through the movie output; the colour space follows the device's
+        // activeColorSpace, so only the codec has to be chosen here.
         var chosen: AVVideoCodecType?
-        switch effective.codec {
-        case .hevc: chosen = available.contains(.hevc) ? .hevc : nil
-        case .proRes422HQ: chosen = available.contains(.proRes422HQ) ? .proRes422HQ : nil
-        case .proResRAW: chosen = available.contains(rawCodec) ? rawCodec : nil
-        case .proResRAWHQ: chosen = available.contains(rawHQCodec) ? rawHQCodec : nil
+        if effective.codec == .hevc || available.contains(effective.codec.avCodecType) {
+            chosen = effective.codec.avCodecType
         }
         if let codec = chosen {
-            movieOutput.setOutputSettings([AVVideoCodecKey: codec.rawValue], for: conn)
-        } else if effective.codec != .hevc {
-            publishError("\(effective.codec.title) is not available for this format; using HEVC.")
+            if effective.codec != .hevc || available.contains(.hevc) {
+                movieOutput.setOutputSettings([AVVideoCodecKey: codec.rawValue], for: conn)
+            }
+        } else {
+            publishError("この組み合わせではProResを使用できません（外部ストレージが必要な場合があります）")
             if available.contains(.hevc) {
                 movieOutput.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc.rawValue], for: conn)
             }
+            q.effective.codec = .hevc
         }
-
-        // Capabilities that can only be discovered from the connected movie output.
-        if available.contains(.proRes422HQ) { knownCaps.proRes422HQ = true }
-        if available.contains(rawCodec) || available.contains(rawHQCodec) { knownCaps.proResRAW = true }
     }
 
     // MARK: - Capabilities
@@ -530,8 +572,9 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         caps.exposureBiasRange = CaptureFormats.range(dev.minExposureTargetBias, dev.maxExposureTargetBias)
         caps.manualFocus = dev.isLockingFocusWithCustomLensPositionSupported
         if cinematicActive { caps.cinematic = true }
-        knownCaps.proRes422HQ = caps.proRes422HQ
-        knownCaps.proResRAW = caps.proResRAW
+        caps.supportedFrameRates = CaptureFormats.supportedFrameRates(of: dev, resolution4K: q.video.resolution4K)
+        if session.outputs.contains(photoOutput), photoOutput.isAppleProRAWSupported { caps.proRAW = true }
+        caps.supportedCodecs.insert(.hevc)
         updateState { $0.capabilities = caps }
     }
 
@@ -556,9 +599,12 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         switch q.manual.exposure {
         case .auto:
             if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
-            let bias = min(max(q.manual.exposureBias, dev.minExposureTargetBias), dev.maxExposureTargetBias)
-            dev.setExposureTargetBias(bias, completionHandler: nil)
+            let lo = dev.minExposureTargetBias, hi = dev.maxExposureTargetBias
+            if lo <= hi {
+                dev.setExposureTargetBias(min(max(q.manual.exposureBias, lo), hi), completionHandler: nil)
+            }
         case .manual(let seconds, let iso):
+            guard dev.isExposureModeSupported(.custom) else { return }
             let fmt = dev.activeFormat
             let minD = fmt.minExposureDuration.seconds
             let maxD = fmt.maxExposureDuration.seconds
@@ -632,12 +678,22 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
 
     private func makePhotoSettings(mode: CameraMode) -> AVCapturePhotoSettings {
         let settings: AVCapturePhotoSettings
-        if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
-            settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc.rawValue])
+        let hevcFormat: [String: Any] = [AVVideoCodecKey: AVVideoCodecType.hevc.rawValue]
+        if mode == .photo, photoOutput.isAppleProRAWEnabled,
+           let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first(where: {
+               AVCapturePhotoOutput.isAppleProRAWPixelFormat($0)
+           }) {
+            settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat, processedFormat: hevcFormat)
+        } else if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
+            settings = AVCapturePhotoSettings(format: hevcFormat)
         } else {
             settings = AVCapturePhotoSettings()
         }
         settings.photoQualityPrioritization = .balanced
+        let maxDims = photoOutput.maxPhotoDimensions
+        if maxDims.width > 0, maxDims.height > 0 {
+            settings.maxPhotoDimensions = maxDims
+        }
         if mode == .portrait {
             if photoOutput.isDepthDataDeliveryEnabled {
                 settings.isDepthDataDeliveryEnabled = true
@@ -651,17 +707,25 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         return settings
     }
 
-    private func photoCaptureFinished(id: Int64, data: Data?, error: Error?,
+    private func photoCaptureFinished(id: Int64, data: Data?, rawData: Data?, error: Error?,
                                       mode: CameraMode, look: LookPreset, aperture: Float) {
         sessionQueue.async { [self] in inflightPhotos[id] = nil }
 
-        guard let data = data else {
+        // If only the DNG arrived, save it as the primary resource without processing.
+        let primary = data ?? rawData
+        guard let primary = primary else {
             publishError(error?.localizedDescription ?? "Photo capture failed.")
             return
         }
+        let dng = (data != nil) ? rawData : nil
         processingQueue.async { [self] in
-            let output = photoProcessor.process(data: data, mode: mode, look: look, aperture: aperture)
-            LibrarySaver.savePhoto(data: output.data) { [weak self] ok, saveError in
+            let output: PhotoProcessor.Output
+            if data != nil {
+                output = photoProcessor.process(data: primary, mode: mode, look: look, aperture: aperture)
+            } else {
+                output = PhotoProcessor.Output(data: primary, thumbnail: LibrarySaver.photoThumbnail(from: primary))
+            }
+            LibrarySaver.savePhoto(data: output.data, rawDNG: dng) { [weak self] ok, saveError in
                 guard let self = self else { return }
                 DispatchQueue.main.async {
                     self.state.isCapturingPhoto = false
@@ -699,7 +763,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             }
             var audioSettings: [String: Any]?
             if audioInput != nil {
-                audioSettings = audioDataOutput.recommendedAudioSettingsForAssetWriter(writingTo: .mov) as? [String: Any]
+                audioSettings = audioDataOutput.recommendedAudioSettingsForAssetWriter(writingTo: .mov)
             }
             do {
                 let recorder = try MovieRecorder(
@@ -787,6 +851,15 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     private func finishRecordingCleanup() {
         phase = .idle
         recordingKind = nil
+        if stopAfterRecording {
+            // stop() was requested while recording; honour it now that the file is finalised.
+            stopAfterRecording = false
+            if !wantsRunning {
+                if session.isRunning { session.stopRunning() }
+                publishRunning()
+                return
+            }
+        }
         if pendingReconfigure {
             pendingReconfigure = false
             reconfigure()
