@@ -9,10 +9,12 @@ import UIKit
 enum LibrarySaver {
 
     /// Saves `data` as the primary photo; `rawDNG` (Apple ProRAW) is stored as the alternate resource.
-    static func savePhoto(data: Data, rawDNG: Data? = nil, completion: @escaping (Bool, Error?) -> Void) {
+    static func savePhoto(data: Data, rawDNG: Data? = nil, isDNG: Bool = false, completion: @escaping (Bool, Error?) -> Void) {
         PHPhotoLibrary.shared().performChanges({
             let request = PHAssetCreationRequest.forAsset()
-            request.addResource(with: .photo, data: data, options: PHAssetResourceCreationOptions())
+            let mainOptions = PHAssetResourceCreationOptions()
+            if isDNG { mainOptions.uniformTypeIdentifier = "com.adobe.raw-image" }
+            request.addResource(with: .photo, data: data, options: mainOptions)
             if let raw = rawDNG {
                 let rawOptions = PHAssetResourceCreationOptions()
                 rawOptions.uniformTypeIdentifier = "com.adobe.raw-image"

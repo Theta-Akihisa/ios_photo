@@ -91,6 +91,9 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     private var inflightPhotos: [Int64: PhotoCaptureDelegate] = [:]
     private var knownCaps = DeviceCapabilities()
     private var staticCapsComputed = false
+    private var hasRAWVideoFormat = false
+    /// RAW codecs that movieOutput has reported at least once (RAW format detection is heuristic).
+    private var stickyRAWCodecs: Set<VideoCodecOption> = []
     private var wantsRunning = false
     private var pendingReconfigure = false
     private var phase: RecordingPhase = .idle
@@ -205,7 +208,12 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     func set(look: LookPreset) {
         state.look = look
         shared.setLook(look)
-        sessionQueue.async { [self] in q.look = look }
+        sessionQueue.async { [self] in
+            q.look = look
+            if q.mode == .photo, let dev = device, session.outputs.contains(photoOutput) {
+                updatePhotoDimensions(mode: q.mode, device: dev)
+            }
+        }
     }
 
     func set(manual: ManualSettings) {
@@ -222,6 +230,10 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         sessionQueue.async { [self] in
             q.video = video
             if q.mode == .video { reconfigure() }
+            // Refresh the frame-rate list for the new resolution even when no reconfigure happened.
+            if let dev = device {
+                publishCapabilities(device: dev, cinematicActive: q.mode == .cinematic && knownCaps.cinematic)
+            }
         }
     }
 
@@ -230,7 +242,13 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         state.photoFormat = photoFormat
         sessionQueue.async { [self] in
             q.photoFormat = photoFormat
-            if q.mode == .photo { reconfigure() }
+            if q.mode == .photo, let dev = device, session.outputs.contains(photoOutput) {
+                session.beginConfiguration()
+                applyProRAWState(mode: q.mode)
+                updatePhotoDimensions(mode: q.mode, device: dev)
+                session.commitConfiguration()
+                publishCapabilities(device: dev, cinematicActive: false)
+            }
         }
     }
 
@@ -287,6 +305,9 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             }
             if let conn = photoOutput.connection(with: .video), conn.isVideoRotationAngleSupported(90) {
                 conn.videoRotationAngle = 90
+            }
+            if mode == .photo, q.photoFormat == .proRAW, !photoOutput.isAppleProRAWEnabled {
+                updateState { $0.errorMessage = "ProRAW を有効にできませんでした。HEIF で保存します。" }
             }
             let settings = makePhotoSettings(mode: mode)
             let id = settings.uniqueID
@@ -437,13 +458,14 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         } else {
             if session.canSetSessionPreset(.photo) { session.sessionPreset = .photo }
             session.automaticallyConfiguresCaptureDeviceForWideColor = true
-            if session.canAddOutput(photoOutput) { session.addOutput(photoOutput) }
-            // Apple ProRAW must be switched on while the session is being configured.
-            let proRAWSupported = session.outputs.contains(photoOutput) && photoOutput.isAppleProRAWSupported
-            if proRAWSupported { knownCaps.proRAW = true }
-            let wantProRAW = proRAWSupported && mode == .photo && q.photoFormat == .proRAW
-            if photoOutput.isAppleProRAWEnabled != wantProRAW {
-                photoOutput.isAppleProRAWEnabled = wantProRAW
+            if session.canAddOutput(photoOutput) {
+                session.addOutput(photoOutput)
+                // Start from the smallest size; configurePhotoOutput raises it once the format is resolved.
+                let startDims = dev.activeFormat.supportedMaxPhotoDimensions
+                if let smallest = startDims.filter({ $0.width > 0 && $0.height > 0 })
+                    .min(by: { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }) {
+                    photoOutput.maxPhotoDimensions = smallest
+                }
             }
         }
 
@@ -508,14 +530,42 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         if photoOutput.isPortraitEffectsMatteDeliverySupported {
             photoOutput.isPortraitEffectsMatteDeliveryEnabled = portrait && photoOutput.isDepthDataDeliveryEnabled
         }
-        // Largest (e.g. 48 MP) output in PHOTO mode; PORTRAIT stays at the smallest size (depth limits).
-        let dims = dev.activeFormat.supportedMaxPhotoDimensions
-        func area(_ d: CMVideoDimensions) -> Int { Int(d.width) * Int(d.height) }
-        let pick = portrait ? dims.min(by: { area($0) < area($1) }) : dims.max(by: { area($0) < area($1) })
-        if let pick = pick, area(pick) > 0 {
-            photoOutput.maxPhotoDimensions = pick
-        }
+        // ProRAW is evaluated here, after the photo preset / format has been applied.
+        applyProRAWState(mode: mode)
+        updatePhotoDimensions(mode: mode, device: dev)
         // Wide colour stays automatic in photo mode (session.automaticallyConfiguresCaptureDeviceForWideColor).
+    }
+
+    /// Enables / disables Apple ProRAW according to the current mode and user choice.
+    private func applyProRAWState(mode: CameraMode) {
+        let supported = photoOutput.isAppleProRAWSupported
+        if supported { knownCaps.proRAW = true }
+        let want = supported && mode == .photo && q.photoFormat == .proRAW
+        if photoOutput.isAppleProRAWEnabled != want {
+            photoOutput.isAppleProRAWEnabled = want
+        }
+    }
+
+    /// Full-resolution (e.g. 48 MP) only when no re-render is needed; otherwise <= 12 MP to bound memory.
+    /// Never exceeds device.activeFormat.supportedMaxPhotoDimensions.
+    private func updatePhotoDimensions(mode: CameraMode, device dev: AVCaptureDevice) {
+        func area(_ d: CMVideoDimensions) -> Int { Int(d.width) * Int(d.height) }
+        let dims = dev.activeFormat.supportedMaxPhotoDimensions.filter { area($0) > 0 }
+        guard !dims.isEmpty else { return }
+        let portrait = (mode == .portrait)
+        let wantFull = !portrait && (q.look == .native || q.photoFormat == .proRAW)
+        let pick: CMVideoDimensions?
+        if wantFull {
+            pick = dims.max(by: { area($0) < area($1) })
+        } else {
+            pick = dims.filter { area($0) <= 12_600_000 }.max(by: { area($0) < area($1) })
+                ?? dims.min(by: { area($0) < area($1) })
+        }
+        guard let target = pick else { return }
+        let cur = photoOutput.maxPhotoDimensions
+        if cur.width != target.width || cur.height != target.height {
+            photoOutput.maxPhotoDimensions = target
+        }
     }
 
     private func configureMovieOutput(effective: VideoFormatSettings) {
@@ -524,7 +574,12 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         if conn.isVideoRotationAngleSupported(90) { conn.videoRotationAngle = 90 }
 
         let available = movieOutput.availableVideoCodecTypes
-        var supported = Set(VideoCodecOption.allCases.filter { available.contains($0.avCodecType) })
+        for c in [VideoCodecOption.proResRAW, .proResRAWHQ] where available.contains(c.avCodecType) {
+            stickyRAWCodecs.insert(c)
+        }
+        var supported = knownCaps.supportedCodecs
+        supported.formUnion(VideoCodecOption.allCases.filter { available.contains($0.avCodecType) })
+        if hasRAWVideoFormat { supported.formUnion(stickyRAWCodecs) }
         supported.insert(.hevc)
         knownCaps.supportedCodecs = supported
 
@@ -556,6 +611,12 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             knownCaps.appleLog = CaptureFormats.anyFormat(of: wide, supports: .appleLog)
             knownCaps.hlg = CaptureFormats.anyFormat(of: wide, supports: .HLG_BT2020)
             knownCaps.cinematic = CinematicSupport.deviceSupportsCinematic(wide)
+            // The movie output only lists codecs for the ACTIVE format, so derive ProRes from all formats.
+            if wide.formats.contains(where: { CaptureFormats.is10Bit422($0) }) {
+                knownCaps.supportedCodecs.formUnion([.proRes422HQ, .proRes422, .proRes422LT, .proRes422Proxy])
+            }
+            hasRAWVideoFormat = wide.formats.contains(where: { CaptureFormats.looksRAW($0) })
+            if hasRAWVideoFormat { knownCaps.supportedCodecs.formUnion(stickyRAWCodecs) }
         }
         knownCaps.portraitDepth = CaptureFormats.hasDepthCapableDevice()
     }
@@ -713,6 +774,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
 
         // If only the DNG arrived, save it as the primary resource without processing.
         let primary = data ?? rawData
+        let primaryIsDNG = (data == nil)
         guard let primary = primary else {
             publishError(error?.localizedDescription ?? "Photo capture failed.")
             return
@@ -725,7 +787,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             } else {
                 output = PhotoProcessor.Output(data: primary, thumbnail: LibrarySaver.photoThumbnail(from: primary))
             }
-            LibrarySaver.savePhoto(data: output.data, rawDNG: dng) { [weak self] ok, saveError in
+            LibrarySaver.savePhoto(data: output.data, rawDNG: dng, isDNG: primaryIsDNG) { [weak self] ok, saveError in
                 guard let self = self else { return }
                 DispatchQueue.main.async {
                     self.state.isCapturingPhoto = false
