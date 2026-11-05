@@ -54,7 +54,8 @@ struct ManualControlsView: View {
         if isExposureAuto { list.append(.ev) }
         list.append(.look)
         if state.mode == .portrait || state.mode == .cinematic { list.append(.aperture) }
-        if state.mode.isVideo { list.append(.format) }
+        // CINEMATIC uses a fixed format (HEVC SDR 4K30), so FORMAT is offered in VIDEO only.
+        if state.mode == .video { list.append(.format) }
         if state.mode == .photo { list.append(.photoFormat) }
         return list
     }

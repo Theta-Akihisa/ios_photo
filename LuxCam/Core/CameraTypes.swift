@@ -136,7 +136,8 @@ struct VideoFormatSettings: Equatable {
     var frameRate: Int = 30                 // 24 / 25 / 30 / 60 / 120
     /// When true, the selected look is rendered into the recorded file (AVAssetWriter, 8-bit SDR HEVC).
     /// HDR / RAW / ProRes / Log keep the source untouched and store the look name as metadata only.
-    var bakesLook: Bool { codec == .hevc && color == .standard }
+    /// Real-time Core Image baking is limited to <= 30 fps to avoid dropped frames.
+    var bakesLook: Bool { codec == .hevc && color == .standard && frameRate <= 30 }
 }
 
 // MARK: - Photo formats

@@ -11,7 +11,7 @@ Leica風のミニマルなUIを持つ iPhone 用カメラアプリ（SwiftUI + A
   - SIGMA: Teal & Orange / Warm Gold / Powder Blue / Mono
   - ※ いずれもメーカー純正LUTではなく、各社の色傾向を参考に手続き的に生成したオリジナルの近似ルックです。
 - **動画フォーマット**: HEVC / ProRes 422 HQ / 422 / 422 LT / 422 Proxy / ProRes RAW / RAW HQ、SDR / HDR(HLG) / Apple Log、24〜120fps
-  - ルックを焼き込むのは HEVC + SDR のみ。HDR・Log・ProRes・RAW ではルックはプレビューのみに適用し、ファイルにはメタデータ（`com.luxcam.look`）として記録します。
+  - ルックを焼き込むのは HEVC + SDR + 30fps 以下のみ。HDR・Log・ProRes・RAW・60fps 以上ではルックはプレビューのみに適用し、ファイルにはメタデータ（`com.luxcam.look`）として記録します。
   - 端末が対応していない選択肢は自動で無効化されます。
 - **写真フォーマット**: HEIF / Apple ProRAW（DNG を HEIF と同時保存、48MP 対応機種では最大解像度）
 

@@ -22,7 +22,7 @@ struct VideoFormatView: View {
                     section("RESOLUTION") { resolutionRow }
                     section("FPS") { fpsRow }
                     if !video.bakesLook {
-                        Text("HDR / LOG / ProRes / RAW ではルックはプレビューのみ（メタデータに記録）")
+                        Text("HDR / LOG / ProRes / RAW / 60fps 以上ではルックはプレビューのみ（メタデータに記録）")
                             .font(.system(size: 12))
                             .foregroundStyle(Theme.dim)
                             .padding(.top, 4)
