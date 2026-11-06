@@ -167,6 +167,8 @@ struct DeviceCapabilities: Equatable {
     var isoRange: ClosedRange<Float> = 50...1600
     var exposureRange: ClosedRange<Double> = (1.0 / 8000.0)...(1.0 / 3.0)
     var exposureBiasRange: ClosedRange<Float> = -2...2
+    /// Largest zoom factor of the active camera (for information only).
+    var maxZoomFactor: CGFloat = 1
 }
 
 // MARK: - Observable state
@@ -177,6 +179,8 @@ struct CameraState: Equatable {
     var manual = ManualSettings()
     var video = VideoFormatSettings()
     var photoFormat: PhotoFormat = .heif
+    /// Emulated camera body + lens (see Gear.swift).
+    var gear = GearSelection()
     var capabilities = DeviceCapabilities()
     /// Simulated aperture (f-number) for PORTRAIT / CINEMATIC.
     var simulatedAperture: Float = 2.8
@@ -190,6 +194,8 @@ struct CameraState: Equatable {
     var liveISO: Float = 0
     var liveShutterSeconds: Double = 0
     var liveLensPosition: Float = 0
+    /// Current videoZoomFactor of the active camera.
+    var liveZoomFactor: CGFloat = 1
 
     /// True when the current preview frames are Apple Log encoded (Preview should normalise for display).
     var previewIsLog = false
@@ -225,4 +231,18 @@ protocol LookRendering: AnyObject {
     /// from Apple Log to a Rec.709-ish display curve (monitoring approximation).
     /// Must be thread-safe (called from capture queue and render thread).
     func apply(_ preset: LookPreset, to image: CIImage, isLogSource: Bool) -> CIImage
+
+    /// Applies the colour look and then the lens rendering character (vignette, bloom, sharpness).
+    /// `aperture` is the simulated f-number (used for wide-open softness); pass nil when not relevant.
+    /// `cheap` = true for real-time paths that must stay fast (e.g. baked 4K recording: no bloom).
+    func apply(_ preset: LookPreset, lens: LensCharacter?, aperture: Float?, cheap: Bool,
+               to image: CIImage, isLogSource: Bool) -> CIImage
+}
+
+extension LookRendering {
+    /// Default: lens character ignored (modules can migrate independently).
+    func apply(_ preset: LookPreset, lens: LensCharacter?, aperture: Float?, cheap: Bool,
+               to image: CIImage, isLogSource: Bool) -> CIImage {
+        apply(preset, to: image, isLogSource: isLogSource)
+    }
 }

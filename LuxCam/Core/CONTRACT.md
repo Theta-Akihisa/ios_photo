@@ -17,6 +17,7 @@ final class CameraService: NSObject, ObservableObject {
     func set(manual: ManualSettings)
     func set(video: VideoFormatSettings)
     func set(photoFormat: PhotoFormat)      // HEIF or Apple ProRAW (DNG); ProRAW ignores looks
+    func set(gear: GearSelection)           // body + lens; normalises lens, enforces body.allows(look)
     func set(simulatedAperture: Float)
     func focus(at devicePoint: CGPoint)     // point of interest in device coordinates (0...1), resets focus to auto
     func capturePhoto()
@@ -43,3 +44,15 @@ struct CameraPreviewView: UIViewRepresentable {
 
 ## UI + App (owner D) — `LuxCam/UI/`, `LuxCam/App/`
 `@main struct LuxCamApp`, `ContentView` owning `@StateObject var camera = CameraService(lookRenderer: LookRenderer.shared)`.
+
+## Gear (Core/Gear.swift)
+- Lens focal length (35mm equiv.) selects the PHYSICAL back camera (ultra wide / wide / telephoto)
+  plus a residual `videoZoomFactor` in PHOTO and VIDEO. PORTRAIT and CINEMATIC keep their own devices.
+- Body `photoAspect` crops photos (not ProRAW DNGs) and masks the preview.
+- Lens `character` is applied after the look via `LookRendering.apply(_:lens:aperture:cheap:to:isLogSource:)`.
+
+## Orientation
+- UI supports portrait + both landscapes. Landscape layout is chosen with `verticalSizeClass == .compact`.
+- Preview orients frames from the window scene's interface orientation.
+- Capture uses `AVCaptureDevice.RotationCoordinator` (`videoRotationAngleForHorizonLevelCapture`) at
+  photo capture / record start. Never rotate the video data output connection.
