@@ -32,9 +32,9 @@ enum MediaLibrary {
 
     /// Loads a small thumbnail without ever prompting for access. `completion` runs on the main queue.
     static func loadThumbnail(localIdentifier: String, completion: @escaping (UIImage?) -> Void) {
-        guard canRead else { return }
+        guard canRead else { completion(nil); return }
         let result = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil)
-        guard let asset = result.firstObject else { return }
+        guard let asset = result.firstObject else { completion(nil); return }
         let options = PHImageRequestOptions()
         options.deliveryMode = .highQualityFormat
         options.resizeMode = .fast

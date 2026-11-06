@@ -5,6 +5,7 @@ import SwiftUI
 import UIKit
 import Photos
 import AVKit
+import UniformTypeIdentifiers
 
 // MARK: - Share sheet
 
@@ -26,7 +27,8 @@ private struct ShareItem: Identifiable {
 // MARK: - Viewer
 
 struct MediaViewerView: View {
-    @ObservedObject var camera: CameraService
+    let ids: [String]
+    let onForget: ([String]) -> Void
     @Environment(\.dismiss) private var dismiss
 
     private enum Access { case checking, granted, denied }
@@ -36,6 +38,10 @@ struct MediaViewerView: View {
     @State private var currentID: String = ""
     @State private var shareItem: ShareItem?
     @State private var isPreparingShare = false
+    @State private var rawIDs: Set<String> = []
+    @State private var showChrome = true
+
+    private static let bottomBarHeight: CGFloat = 52
 
     private var currentIndex: Int? {
         assets.firstIndex { $0.localIdentifier == currentID }
@@ -105,31 +111,45 @@ struct MediaViewerView: View {
     }
 
     private var content: some View {
+        // Read the bottom safe-area inset (home indicator) here, where the safe area is respected,
+        // because the pager itself ignores the safe area.
+        GeometryReader { geo in
+            pager(bottomSafeInset: geo.safeAreaInsets.bottom)
+        }
+    }
+
+    private func pager(bottomSafeInset: CGFloat) -> some View {
         ZStack {
             TabView(selection: $currentID) {
                 ForEach(assets, id: \.localIdentifier) { asset in
-                    page(for: asset)
+                    page(for: asset, bottomSafeInset: bottomSafeInset)
                         .tag(asset.localIdentifier)
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
             .ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                topBar
-                Spacer(minLength: 0)
-                bottomBar
+            if showChrome {
+                VStack(spacing: 0) {
+                    topBar
+                    Spacer(minLength: 0)
+                    bottomBar
+                }
             }
         }
     }
 
     @ViewBuilder
-    private func page(for asset: PHAsset) -> some View {
+    private func page(for asset: PHAsset, bottomSafeInset: CGFloat) -> some View {
         let isCurrent = asset.localIdentifier == currentID
         if asset.mediaType == .video {
-            VideoPageView(asset: asset, isCurrent: isCurrent)
+            // Keep AVKit's transport controls above the bottom bar and the home indicator.
+            VideoPageView(asset: asset, isCurrent: isCurrent,
+                          bottomInset: (showChrome ? Self.bottomBarHeight : 0) + bottomSafeInset)
         } else {
-            PhotoPageView(asset: asset, isCurrent: isCurrent)
+            PhotoPageView(asset: asset, isCurrent: isCurrent, onTap: {
+                withAnimation(.easeInOut(duration: 0.2)) { showChrome.toggle() }
+            })
         }
     }
 
@@ -163,7 +183,7 @@ struct MediaViewerView: View {
                             .foregroundStyle(Theme.text)
                     }
                     HStack(spacing: 6) {
-                        if MediaLibrary.hasRAW(asset) { badge("RAW") }
+                        if rawIDs.contains(asset.localIdentifier) { badge("RAW") }
                         if asset.mediaType == .video {
                             badge("VIDEO " + Fmt.mmss(asset.duration))
                         }
@@ -225,6 +245,7 @@ struct MediaViewerView: View {
         }
         .padding(.horizontal, Theme.gutter - 8)
         .padding(.vertical, 4)
+        .frame(height: Self.bottomBarHeight)
         .background(Color.black.opacity(0.55))
     }
 
@@ -252,9 +273,10 @@ struct MediaViewerView: View {
     }
 
     private func reload() {
-        let result = MediaLibrary.fetch(ids: camera.state.recentAssetIDs)
+        let result = MediaLibrary.fetch(ids: ids)
         assets = result.assets
-        if !result.missing.isEmpty { camera.forgetAssets(result.missing) }
+        rawIDs = Set(result.assets.filter { MediaLibrary.hasRAW($0) }.map { $0.localIdentifier })
+        if !result.missing.isEmpty { onForget(result.missing) }
         if currentIndex == nil { currentID = assets.first?.localIdentifier ?? "" }
     }
 
@@ -263,27 +285,72 @@ struct MediaViewerView: View {
     private func share() {
         guard let asset = currentAsset, !isPreparingShare else { return }
         isPreparingShare = true
+        let resources = PHAssetResource.assetResources(for: asset)
         if asset.mediaType == .video {
-            let options = PHVideoRequestOptions()
-            options.isNetworkAccessAllowed = true
-            PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
-                let url = (avAsset as? AVURLAsset)?.url
-                DispatchQueue.main.async {
-                    isPreparingShare = false
-                    if let url { shareItem = ShareItem(items: [url]) }
-                }
+            let resource = resources.first { $0.type == .fullSizeVideo }
+                ?? resources.first { $0.type == .video }
+            guard let resource else {
+                isPreparingShare = false
+                return
+            }
+            Self.export(resource) { url in
+                isPreparingShare = false
+                if let url { shareItem = ShareItem(items: [url]) }
             }
         } else {
+            let dng = resources.first { $0.type == .alternatePhoto }
             let options = PHImageRequestOptions()
             options.isNetworkAccessAllowed = true
             options.version = .current
-            PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
-                let image = data.flatMap { UIImage(data: $0) }
+            PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) { data, uti, _, _ in
+                var photoURL: URL?
+                if let data {
+                    let ext = uti.flatMap { UTType($0)?.preferredFilenameExtension } ?? "jpg"
+                    let dir = FileManager.default.temporaryDirectory
+                        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                    let url = dir.appendingPathComponent("LuxCam-\(Int(Date().timeIntervalSince1970)).\(ext)")
+                    do {
+                        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                        try data.write(to: url, options: .atomic)
+                        photoURL = url
+                    } catch {
+                        photoURL = nil
+                    }
+                }
                 DispatchQueue.main.async {
-                    isPreparingShare = false
-                    if let image { shareItem = ShareItem(items: [image]) }
+                    guard let dng else {
+                        isPreparingShare = false
+                        if let photoURL { shareItem = ShareItem(items: [photoURL]) }
+                        return
+                    }
+                    Self.export(dng) { rawURL in
+                        isPreparingShare = false
+                        let urls = [photoURL, rawURL].compactMap { $0 }
+                        if !urls.isEmpty { shareItem = ShareItem(items: urls) }
+                    }
                 }
             }
+        }
+    }
+
+    /// Writes the original resource data to a temp file. `completion` runs on the main queue.
+    private static func export(_ resource: PHAssetResource, completion: @escaping (URL?) -> Void) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let url = dir.appendingPathComponent(resource.originalFilename)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+        } catch {
+            completion(nil)
+            return
+        }
+        let opts = PHAssetResourceRequestOptions()
+        opts.isNetworkAccessAllowed = true
+        PHAssetResourceManager.default().writeData(for: resource, toFile: url, options: opts) { error in
+            DispatchQueue.main.async { completion(error == nil ? url : nil) }
         }
     }
 
@@ -313,7 +380,7 @@ struct MediaViewerView: View {
             }
             assets = next
         }
-        camera.forgetAssets([id])
+        onForget([id])
         if assets.isEmpty { dismiss() }
     }
 }
@@ -323,9 +390,11 @@ struct MediaViewerView: View {
 private struct PhotoPageView: View {
     let asset: PHAsset
     let isCurrent: Bool
+    let onTap: () -> Void
 
     @Environment(\.displayScale) private var displayScale
     @State private var image: UIImage?
+    @State private var failed = false
     @State private var requestID: PHImageRequestID?
     @State private var scale: CGFloat = 1
     @State private var baseScale: CGFloat = 1
@@ -355,11 +424,17 @@ private struct PhotoPageView: View {
                                 baseScale = scale
                             }
                         }
+                } else if failed {
+                    Text("表示できません")
+                        .font(Theme.mono(14))
+                        .foregroundStyle(Theme.dim)
                 } else {
                     ProgressView().tint(Theme.text)
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
+            .contentShape(Rectangle())
+            .onTapGesture { onTap() }
             .clipped()
             .onAppear { load(viewSize: geo.size) }
         }
@@ -380,9 +455,14 @@ private struct PhotoPageView: View {
             targetSize: CGSize(width: side, height: side),
             contentMode: .aspectFit,
             options: options
-        ) { result, _ in
+        ) { result, info in
+            let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) == true
             DispatchQueue.main.async {
                 if let result { image = result }
+                if !degraded {
+                    requestID = nil
+                    if result == nil && image == nil { failed = true }
+                }
             }
         }
     }
@@ -400,6 +480,7 @@ private struct PhotoPageView: View {
 private struct VideoPageView: View {
     let asset: PHAsset
     let isCurrent: Bool
+    let bottomInset: CGFloat
 
     @State private var player: AVPlayer?
     @State private var requestID: PHImageRequestID?
@@ -409,6 +490,7 @@ private struct VideoPageView: View {
             Theme.black
             if let player {
                 VideoPlayer(player: player)
+                    .padding(.bottom, bottomInset)
             } else {
                 ProgressView().tint(Theme.text)
             }

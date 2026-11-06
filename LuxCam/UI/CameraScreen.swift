@@ -45,8 +45,16 @@ struct CameraScreen: View {
         }
         .animation(.easeInOut(duration: 0.25), value: state.mode)
         .sheet(isPresented: $showGear) { GearPickerView(camera: camera) }
-        .fullScreenCover(isPresented: $showViewer) { MediaViewerView(camera: camera) }
+        .fullScreenCover(isPresented: $showViewer) {
+            MediaViewerView(ids: camera.state.recentAssetIDs, onForget: { camera.forgetAssets($0) })
+        }
         .onAppear { loadFallbackThumbnail() }
+        .onChange(of: showViewer) { _, shown in
+            if !shown { loadFallbackThumbnail() }
+        }
+        .onChange(of: state.lastThumbnail == nil) { _, isNil in
+            if isNil { loadFallbackThumbnail() }
+        }
         .onChange(of: state.recentAssetIDs) { _, _ in loadFallbackThumbnail() }
         .onChange(of: state.isCapturingPhoto) { _, capturing in
             guard capturing else { return }
@@ -285,7 +293,7 @@ struct CameraScreen: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(!hasMedia)
+        .disabled(!hasMedia || state.isRecording)
         .accessibilityLabel("最新の撮影")
     }
 
