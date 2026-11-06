@@ -3,6 +3,7 @@
 //  viewfinder on the leading side, control column on the trailing side.
 
 import SwiftUI
+import UIKit
 
 struct CameraScreen: View {
     @ObservedObject var camera: CameraService
@@ -15,6 +16,8 @@ struct CameraScreen: View {
     @State private var reticleToken = UUID()
     @State private var flash = false
     @State private var dismissedError: String?
+    @State private var showViewer = false
+    @State private var fallbackThumbnail: UIImage?
     @StateObject private var manualModel = ManualControlsModel()
     /// Portrait viewfinder slot (global coordinates), reported by the overlay layout.
     @State private var slotFrame: CGRect = .zero
@@ -42,6 +45,9 @@ struct CameraScreen: View {
         }
         .animation(.easeInOut(duration: 0.25), value: state.mode)
         .sheet(isPresented: $showGear) { GearPickerView(camera: camera) }
+        .fullScreenCover(isPresented: $showViewer) { MediaViewerView(camera: camera) }
+        .onAppear { loadFallbackThumbnail() }
+        .onChange(of: state.recentAssetIDs) { _, _ in loadFallbackThumbnail() }
         .onChange(of: state.isCapturingPhoto) { _, capturing in
             guard capturing else { return }
             flash = true
@@ -247,17 +253,39 @@ struct CameraScreen: View {
         }
     }
 
-    private func thumbnail(size: CGFloat) -> some View {
-        Group {
-            if let image = state.lastThumbnail {
-                Image(uiImage: image).resizable().scaledToFill()
-            } else {
-                Theme.panel
-            }
+    private var hasMedia: Bool {
+        state.lastThumbnail != nil || !state.recentAssetIDs.isEmpty
+    }
+
+    private func loadFallbackThumbnail() {
+        guard state.lastThumbnail == nil, let id = state.recentAssetIDs.first else {
+            fallbackThumbnail = nil
+            return
         }
-        .frame(width: size, height: size)
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(Theme.hairline, lineWidth: 0.5))
+        MediaLibrary.loadThumbnail(localIdentifier: id) { image in
+            fallbackThumbnail = image
+        }
+    }
+
+    private func thumbnail(size: CGFloat) -> some View {
+        Button {
+            showViewer = true
+        } label: {
+            Group {
+                if let image = state.lastThumbnail ?? fallbackThumbnail {
+                    Image(uiImage: image).resizable().scaledToFill()
+                } else {
+                    Theme.panel
+                }
+            }
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(Theme.hairline, lineWidth: 0.5))
+            .opacity(hasMedia ? 1 : 0.4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!hasMedia)
         .accessibilityLabel("最新の撮影")
     }
 
