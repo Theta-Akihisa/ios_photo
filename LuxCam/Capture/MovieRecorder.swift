@@ -33,7 +33,8 @@ final class MovieRecorder {
 
     /// - Parameters:
     ///   - audioSettings: output settings for the audio input; nil with `hasAudio` uses AAC mono.
-    init(url: URL, width: Int, height: Int, frameRate: Int,
+    ///   - rotationAngle: clockwise rotation in degrees (from RotationCoordinator) stored as the track transform.
+    init(url: URL, width: Int, height: Int, frameRate: Int, rotationAngle: CGFloat,
          hasAudio: Bool, audioSettings: [String: Any]?,
          renderer: LookRendering, context: CIContext,
          metadata: [AVMetadataItem]) throws {
@@ -68,8 +69,8 @@ final class MovieRecorder {
         ]
         let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         vIn.expectsMediaDataInRealTime = true
-        // Sensor frames are landscape-right; rotate for portrait playback.
-        vIn.transform = CGAffineTransform(rotationAngle: .pi / 2)
+        // Sensor frames are landscape-right; rotate to the horizon-level angle chosen at record start.
+        vIn.transform = CGAffineTransform(rotationAngle: rotationAngle * .pi / 180)
         self.videoInput = vIn
 
         let attrs: [String: Any] = [
@@ -105,7 +106,7 @@ final class MovieRecorder {
 
     // MARK: Appending (called on the video data queue)
 
-    func appendVideo(_ sample: CMSampleBuffer, pixelBuffer: CVPixelBuffer, look: LookPreset, isLog: Bool) {
+    func appendVideo(_ sample: CMSampleBuffer, pixelBuffer: CVPixelBuffer, look: LookPreset, gear: GearSelection, isLog: Bool) {
         lock.lock()
         defer { lock.unlock() }
         guard !finished, !failed else { return }
@@ -129,8 +130,9 @@ final class MovieRecorder {
             ? CIImage(cvPixelBuffer: pixelBuffer, options: [.colorSpace: NSNull()])
             : CIImage(cvPixelBuffer: pixelBuffer)
         let extent = image.extent
-        if look != .native || isLog {
-            image = renderer.apply(look, to: image, isLogSource: isLog)
+        if look != .native || isLog || !CaptureFormats.isNeutral(gear) {
+            image = renderer.apply(look, gear: gear, aperture: nil, cheap: true,
+                                   to: image, isLogSource: isLog)
         }
         context.render(image, to: dst, bounds: extent, colorSpace: outputColorSpace)
 

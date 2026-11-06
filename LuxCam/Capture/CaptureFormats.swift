@@ -20,6 +20,49 @@ enum CaptureFormats {
             ?? AVCaptureDevice.default(for: .video)
     }
 
+    /// Physical back camera for PHOTO / VIDEO selected by the gear's 35mm-equivalent focal length.
+    /// Other modes keep `captureDevice(for:)`. Missing cameras fall back to the wide camera.
+    static func captureDevice(for mode: CameraMode, gear: GearSelection) -> AVCaptureDevice? {
+        guard mode == .photo || mode == .video else { return captureDevice(for: mode) }
+        let f = gear.lens.equivalentFocalLength(on: gear.body)
+        if f < 20,
+           let uw = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back) {
+            return uw
+        }
+        if f >= 100,
+           let tele = AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back) {
+            return tele
+        }
+        return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+            ?? captureDevice(for: mode)
+    }
+
+    /// 35mm-equivalent focal length of the device's native (zoom 1) field of view.
+    /// Ultra wide / telephoto are derived from the field of view relative to the wide camera.
+    static func baseFocalLength(of dev: AVCaptureDevice) -> Double {
+        let fallback: Double
+        let plausible: ClosedRange<Double>
+        switch dev.deviceType {
+        case .builtInUltraWideCamera: fallback = 13; plausible = 8...18
+        case .builtInTelephotoCamera: fallback = 120; plausible = 60...200
+        default: return 24
+        }
+        guard let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            return fallback
+        }
+        let fw = Double(wide.activeFormat.videoFieldOfView)
+        let fd = Double(dev.activeFormat.videoFieldOfView)
+        guard fw > 1, fd > 1, fw < 179, fd < 179 else { return fallback }
+        let v = 24 * tan(fw * Double.pi / 360) / tan(fd * Double.pi / 360)
+        return (v.isFinite && plausible.contains(v)) ? v : fallback
+    }
+
+    /// True when neither the body nor the lens adds any rendering character.
+    static func isNeutral(_ gear: GearSelection) -> Bool {
+        gear.body.character == BodyCharacter.neutral && gear.lens.character == LensCharacter.neutral
+            && !gear.body.isMonochrome
+    }
+
     static let depthCapableTypes: [AVCaptureDevice.DeviceType] = [
         .builtInTripleCamera, .builtInDualWideCamera, .builtInDualCamera
     ]
@@ -177,8 +220,17 @@ enum CaptureFormats {
     }
 
     /// Metadata items storing the look name inside the movie.
-    static func lookMetadata(_ preset: LookPreset) -> [AVMetadataItem] {
+    static func lookMetadata(_ preset: LookPreset, gear: GearSelection? = nil) -> [AVMetadataItem] {
         var items: [AVMetadataItem] = []
+
+        if let gear = gear {
+            let g = AVMutableMetadataItem()
+            g.keySpace = .quickTimeMetadata
+            g.key = "com.luxcam.gear" as NSString
+            g.value = "\(gear.body.rawValue)/\(gear.lens.rawValue)" as NSString
+            g.dataType = kCMMetadataBaseDataType_UTF8 as String
+            items.append(g)
+        }
 
         let look = AVMutableMetadataItem()
         look.keySpace = .quickTimeMetadata

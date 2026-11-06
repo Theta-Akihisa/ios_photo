@@ -15,14 +15,16 @@ private final class RenderShared: @unchecked Sendable {
     private var _look: LookPreset = .native
     private var _isLog = false
     private var _recorder: MovieRecorder?
+    private var _gear = GearSelection()
 
     func setLook(_ v: LookPreset) { lock.lock(); _look = v; lock.unlock() }
+    func setGear(_ v: GearSelection) { lock.lock(); _gear = v; lock.unlock() }
     func setLog(_ v: Bool) { lock.lock(); _isLog = v; lock.unlock() }
     func setRecorder(_ v: MovieRecorder?) { lock.lock(); _recorder = v; lock.unlock() }
 
-    func snapshot() -> (look: LookPreset, isLog: Bool, recorder: MovieRecorder?) {
+    func snapshot() -> (look: LookPreset, gear: GearSelection, isLog: Bool, recorder: MovieRecorder?) {
         lock.lock(); defer { lock.unlock() }
-        return (_look, _isLog, _recorder)
+        return (_look, _gear, _isLog, _recorder)
     }
 }
 
@@ -82,6 +84,9 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     private let session = AVCaptureSession()
     private var device: AVCaptureDevice?
     private var videoInput: AVCaptureDeviceInput?
+    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    private var currentZoom: CGFloat = 1
+    private var capsReferenceID: String?
     private var audioInput: AVCaptureDeviceInput?
     private let photoOutput = AVCapturePhotoOutput()
     private let videoDataOutput = AVCaptureVideoDataOutput()
@@ -108,6 +113,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         var manual = ManualSettings()
         var video = VideoFormatSettings()
         var aperture: Float = 2.8
+        var gear = GearSelection()
         var photoFormat: PhotoFormat = .heif
         /// Video settings actually applied (cinematic overrides, colour fallbacks).
         var effective = VideoFormatSettings()
@@ -174,7 +180,9 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                 self.q.video = snapshot.video
                 self.q.aperture = snapshot.simulatedAperture
                 self.q.photoFormat = snapshot.photoFormat
+                self.q.gear = snapshot.gear
                 self.shared.setLook(snapshot.look)
+                self.shared.setGear(snapshot.gear)
                 self.reconfigure()
                 if !self.session.isRunning { self.session.startRunning() }
                 self.publishRunning()
@@ -199,8 +207,13 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     func set(mode: CameraMode) {
         guard mode != state.mode, !state.isRecording else { return }
         state.mode = mode
+        if mode == .portrait || mode == .cinematic {
+            state.simulatedAperture = max(state.simulatedAperture, state.gear.lens.maxAperture)
+        }
+        let aperture = state.simulatedAperture
         sessionQueue.async { [self] in
             q.mode = mode
+            q.aperture = aperture
             reconfigure()
         }
     }
@@ -252,12 +265,50 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
-    func set(simulatedAperture: Float) {
+    func set(simulatedAperture requested: Float) {
+        var simulatedAperture = requested
+        if state.mode == .portrait || state.mode == .cinematic {
+            simulatedAperture = max(simulatedAperture, state.gear.lens.maxAperture)
+        }
         state.simulatedAperture = simulatedAperture
         sessionQueue.async { [self] in
             q.aperture = simulatedAperture
             if q.mode == .cinematic, let input = videoInput, let dev = device {
                 CinematicSupport.setAperture(simulatedAperture, input: input, device: dev)
+            }
+        }
+    }
+
+    func set(gear requested: GearSelection) {
+        let g = requested.normalized()
+        let bodyChanged = g.body != state.gear.body
+        guard g != state.gear else { return }
+        state.gear = g
+        shared.setGear(g)
+        if bodyChanged || !g.body.allows(state.look) {
+            set(look: g.body.defaultLook)
+        }
+        if state.mode == .portrait || state.mode == .cinematic {
+            state.simulatedAperture = max(state.simulatedAperture, g.lens.maxAperture)
+        }
+        let aperture = state.simulatedAperture
+        sessionQueue.async { [self] in
+            q.gear = g
+            q.aperture = aperture
+            if q.mode == .cinematic, let input = videoInput, let dev = device {
+                CinematicSupport.setAperture(aperture, input: input, device: dev)
+            }
+            // PHOTO / VIDEO: the gear may select another physical camera; PORTRAIT / CINEMATIC keep theirs.
+            guard q.mode == .photo || q.mode == .video else { return }
+            let target = CaptureFormats.captureDevice(for: q.mode, gear: g)
+            if phase == .idle, let dev = device, let target = target, target.uniqueID == dev.uniqueID {
+                applyGearZoom(on: dev)
+                if q.mode == .photo, session.outputs.contains(photoOutput) {
+                    updatePhotoDimensions(mode: q.mode, device: dev)
+                }
+                publishCapabilities(device: dev, cinematicActive: false)
+            } else {
+                reconfigure()      // new camera (or deferred until recording ends)
             }
         }
     }
@@ -296,6 +347,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         guard !state.isCapturingPhoto, mode == .photo || mode == .portrait else { return }
         state.isCapturingPhoto = true
         let look = state.look
+        let gear = state.gear
         let aperture = state.simulatedAperture
 
         sessionQueue.async { [self] in
@@ -303,8 +355,9 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                 publishError("Camera is not ready.")
                 return
             }
-            if let conn = photoOutput.connection(with: .video), conn.isVideoRotationAngleSupported(90) {
-                conn.videoRotationAngle = 90
+            if let conn = photoOutput.connection(with: .video) {
+                let angle = currentCaptureAngle()
+                if conn.isVideoRotationAngleSupported(angle) { conn.videoRotationAngle = angle }
             }
             if mode == .photo, q.photoFormat == .proRAW, !photoOutput.isAppleProRAWEnabled {
                 updateState { $0.errorMessage = "ProRAW を有効にできませんでした。HEIF で保存します。" }
@@ -313,7 +366,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             let id = settings.uniqueID
             let delegate = PhotoCaptureDelegate { [weak self] data, rawData, error in
                 self?.photoCaptureFinished(id: id, data: data, rawData: rawData, error: error,
-                                           mode: mode, look: look, aperture: aperture)
+                                           mode: mode, look: look, gear: gear, aperture: aperture)
             }
             inflightPhotos[id] = delegate
             photoOutput.capturePhoto(with: settings, delegate: delegate)
@@ -384,10 +437,12 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         videoInput = nil
         audioInput = nil
         device = nil
+        rotationCoordinator = nil
+        currentZoom = 1
         shared.setRecorder(nil)
 
-        // Device + input
-        guard let dev = CaptureFormats.captureDevice(for: mode),
+        // Device + input (PHOTO / VIDEO: physical camera chosen by the gear's focal length)
+        guard let dev = CaptureFormats.captureDevice(for: mode, gear: q.gear),
               let input = try? AVCaptureDeviceInput(device: dev),
               session.canAddInput(input) else {
             session.commitConfiguration()
@@ -397,9 +452,11 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         session.addInput(input)
         videoInput = input
         device = dev
+        rotationCoordinator = AVCaptureDevice.RotationCoordinator(device: dev, previewLayer: nil)
 
-        // Static capabilities (computed once from the wide camera).
+        // Static capabilities (cinematic / depth once; Log / HLG / codecs per active physical camera).
         computeStaticCapabilities()
+        updateDeviceCapabilities(activeDevice: dev, mode: mode)
 
         // Audio input for video modes.
         if isVideoMode, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
@@ -471,6 +528,9 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
 
         q.effective = effective
         session.commitConfiguration()
+
+        // Gear zoom must come after the format is final (changing activeFormat resets the zoom factor).
+        applyGearZoom(on: dev)
 
         // Post-commit configuration (needs live connections).
         if isVideoMode {
@@ -553,9 +613,17 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         let dims = dev.activeFormat.supportedMaxPhotoDimensions.filter { area($0) > 0 }
         guard !dims.isEmpty else { return }
         let portrait = (mode == .portrait)
-        let wantFull = !portrait && (q.look == .native || q.photoFormat == .proRAW)
+        // Full resolution only when nothing is re-rendered: native look, 4:3 body, neutral gear characters
+        // (or ProRAW, whose DNG is never re-rendered).
+        let noRerender = q.look == .native && abs(q.gear.body.photoAspect - 4.0 / 3.0) < 0.001
+            && CaptureFormats.isNeutral(q.gear)
+        let wantFull = !portrait && (noRerender || q.photoFormat == .proRAW)
         let pick: CMVideoDimensions?
-        if wantFull {
+        if wantFull && currentZoom > 1.05 {
+            // Zoomed: 48 MP would only be an upscaled crop, so stay at <= ~24 MP (5712x4284 = 24.5 MP).
+            pick = dims.filter { area($0) <= 25_000_000 }.max(by: { area($0) < area($1) })
+                ?? dims.min(by: { area($0) < area($1) })
+        } else if wantFull {
             pick = dims.max(by: { area($0) < area($1) })
         } else {
             pick = dims.filter { area($0) <= 12_600_000 }.max(by: { area($0) < area($1) })
@@ -571,7 +639,8 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     private func configureMovieOutput(effective: VideoFormatSettings) {
         guard session.outputs.contains(movieOutput) else { return }
         guard let conn = movieOutput.connection(with: .video) else { return }
-        if conn.isVideoRotationAngleSupported(90) { conn.videoRotationAngle = 90 }
+        let angle = currentCaptureAngle()
+        if conn.isVideoRotationAngleSupported(angle) { conn.videoRotationAngle = angle }
 
         let available = movieOutput.availableVideoCodecTypes
         for c in [VideoCodecOption.proResRAW, .proResRAWHQ] where available.contains(c.avCodecType) {
@@ -604,21 +673,37 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
 
     // MARK: - Capabilities
 
+    /// Device independent capabilities (computed once from the wide camera).
     private func computeStaticCapabilities() {
         guard !staticCapsComputed else { return }
         staticCapsComputed = true
         if let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) {
-            knownCaps.appleLog = CaptureFormats.anyFormat(of: wide, supports: .appleLog)
-            knownCaps.hlg = CaptureFormats.anyFormat(of: wide, supports: .HLG_BT2020)
             knownCaps.cinematic = CinematicSupport.deviceSupportsCinematic(wide)
-            // The movie output only lists codecs for the ACTIVE format, so derive ProRes from all formats.
-            if wide.formats.contains(where: { CaptureFormats.is10Bit422($0) }) {
-                knownCaps.supportedCodecs.formUnion([.proRes422HQ, .proRes422, .proRes422LT, .proRes422Proxy])
-            }
-            hasRAWVideoFormat = wide.formats.contains(where: { CaptureFormats.looksRAW($0) })
-            if hasRAWVideoFormat { knownCaps.supportedCodecs.formUnion(stickyRAWCodecs) }
         }
         knownCaps.portraitDepth = CaptureFormats.hasDepthCapableDevice()
+    }
+
+    /// Log / HLG / ProRes / RAW support of the camera actually used for recording. PHOTO / VIDEO use the
+    /// gear-selected physical camera (ultra wide / telephoto may lack some); other modes use the wide camera.
+    private func updateDeviceCapabilities(activeDevice dev: AVCaptureDevice, mode: CameraMode) {
+        let usesGearDevice = (mode == .photo || mode == .video)
+        let ref: AVCaptureDevice = usesGearDevice
+            ? dev
+            : (AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) ?? dev)
+        if capsReferenceID != ref.uniqueID {
+            capsReferenceID = ref.uniqueID
+            stickyRAWCodecs.removeAll()
+        }
+        knownCaps.appleLog = CaptureFormats.anyFormat(of: ref, supports: .appleLog)
+        knownCaps.hlg = CaptureFormats.anyFormat(of: ref, supports: .HLG_BT2020)
+        // The movie output only lists codecs for the ACTIVE format, so derive ProRes from all formats.
+        var codecs: Set<VideoCodecOption> = [.hevc]
+        if ref.formats.contains(where: { CaptureFormats.is10Bit422($0) }) {
+            codecs.formUnion([.proRes422HQ, .proRes422, .proRes422LT, .proRes422Proxy])
+        }
+        hasRAWVideoFormat = ref.formats.contains(where: { CaptureFormats.looksRAW($0) })
+        if hasRAWVideoFormat { codecs.formUnion(stickyRAWCodecs) }
+        knownCaps.supportedCodecs = codecs
     }
 
     private func publishCapabilities(device dev: AVCaptureDevice, cinematicActive: Bool) {
@@ -634,9 +719,46 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         caps.manualFocus = dev.isLockingFocusWithCustomLensPositionSupported
         if cinematicActive { caps.cinematic = true }
         caps.supportedFrameRates = CaptureFormats.supportedFrameRates(of: dev, resolution4K: q.video.resolution4K)
-        if session.outputs.contains(photoOutput), photoOutput.isAppleProRAWSupported { caps.proRAW = true }
+        if session.outputs.contains(photoOutput) { caps.proRAW = photoOutput.isAppleProRAWSupported }
+        caps.maxZoomFactor = max(1, fmt.videoMaxZoomFactor)
         caps.supportedCodecs.insert(.hevc)
-        updateState { $0.capabilities = caps }
+        let zoom = dev.videoZoomFactor
+        updateState { $0.capabilities = caps; $0.liveZoomFactor = zoom }
+    }
+
+    // MARK: - Gear zoom / orientation (sessionQueue)
+
+    /// Clockwise rotation angle (degrees) that makes captures horizon-level; 90 (portrait) as a fallback.
+    private func currentCaptureAngle() -> CGFloat {
+        rotationCoordinator?.videoRotationAngleForHorizonLevelCapture ?? 90
+    }
+
+    /// Residual zoom on the chosen physical camera for the gear's equivalent focal length.
+    private func gearZoom(for dev: AVCaptureDevice) -> CGFloat {
+        guard q.mode == .photo || q.mode == .video else { return 1 }
+        if q.mode == .video && q.video.codec.isRAW { return 1 }     // ProRes RAW: sensor native
+        let f = q.gear.lens.equivalentFocalLength(on: q.gear.body)
+        let base = CaptureFormats.baseFocalLength(of: dev)
+        guard base > 0, f.isFinite else { return 1 }
+        let fmt = dev.activeFormat
+        var z = min(max(1, CGFloat(f / base)), fmt.videoMaxZoomFactor)
+        // Snap to a native-resolution crop (e.g. 2x on the 48 MP main camera) when close enough.
+        let snaps = fmt.secondaryNativeResolutionZoomFactors
+        if let best = snaps.min(by: { abs($0 - z) < abs($1 - z) }), best > 0, abs(best / z - 1) <= 0.08 {
+            z = best
+        }
+        return max(1, z)
+    }
+
+    private func applyGearZoom(on dev: AVCaptureDevice) {
+        let target = gearZoom(for: dev)
+        do { try dev.lockForConfiguration() } catch { return }
+        defer { dev.unlockForConfiguration() }
+        if dev.isRampingVideoZoom { dev.cancelVideoZoomRamp() }
+        let clamped = min(max(target, dev.minAvailableVideoZoomFactor), dev.maxAvailableVideoZoomFactor)
+        dev.videoZoomFactor = clamped
+        currentZoom = clamped
+        updateState { $0.liveZoomFactor = clamped }
     }
 
     // MARK: - Manual controls (sessionQueue)
@@ -692,6 +814,11 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             dev.observe(\.lensPosition, options: [.new]) { [weak self, weak dev] _, _ in
                 guard let self = self, let dev = dev else { return }
                 self.publishLive(from: dev)
+            },
+            dev.observe(\.videoZoomFactor, options: [.new]) { [weak self, weak dev] _, _ in
+                guard let self = self, let dev = dev else { return }
+                let z = dev.videoZoomFactor
+                self.updateState { $0.liveZoomFactor = z }
             }
         ]
         pushLive(dev)
@@ -769,7 +896,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func photoCaptureFinished(id: Int64, data: Data?, rawData: Data?, error: Error?,
-                                      mode: CameraMode, look: LookPreset, aperture: Float) {
+                                      mode: CameraMode, look: LookPreset, gear: GearSelection, aperture: Float) {
         sessionQueue.async { [self] in inflightPhotos[id] = nil }
 
         // If only the DNG arrived, save it as the primary resource without processing.
@@ -783,7 +910,11 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         processingQueue.async { [self] in
             let output: PhotoProcessor.Output
             if data != nil {
-                output = photoProcessor.process(data: primary, mode: mode, look: look, aperture: aperture)
+                // The processed companion of a ProRAW pair is left uncropped / un-geared like the 4:3 DNG.
+                let isRAWPair = (rawData != nil)
+                output = photoProcessor.process(data: primary, mode: mode, look: look,
+                                                gear: isRAWPair ? GearSelection() : gear,
+                                                aperture: aperture, cropToBody: !isRAWPair)
             } else {
                 output = PhotoProcessor.Output(data: primary, thumbnail: LibrarySaver.photoThumbnail(from: primary))
             }
@@ -807,6 +938,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     private func startRecordingOnQueue() {
         guard q.mode.isVideo, session.isRunning, device != nil else { return }
         let look = q.look
+        let gear = q.gear
         let baked = (q.mode == .video) && q.effective.bakesLook
 
         if baked {
@@ -831,9 +963,10 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                 let recorder = try MovieRecorder(
                     url: CaptureFormats.temporaryMovieURL(),
                     width: w, height: h, frameRate: q.effective.frameRate,
+                    rotationAngle: currentCaptureAngle(),
                     hasAudio: audioInput != nil, audioSettings: audioSettings,
                     renderer: lookRenderer, context: ciContext,
-                    metadata: CaptureFormats.lookMetadata(look))
+                    metadata: CaptureFormats.lookMetadata(look, gear: gear))
                 recordingKind = .baked(recorder)
                 shared.setRecorder(recorder)
             } catch {
@@ -845,10 +978,11 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                 publishError("Recording is not available in this configuration.")
                 return
             }
-            if let conn = movieOutput.connection(with: .video), conn.isVideoRotationAngleSupported(90) {
-                conn.videoRotationAngle = 90
+            if let conn = movieOutput.connection(with: .video) {
+                let angle = currentCaptureAngle()
+                if conn.isVideoRotationAngleSupported(angle) { conn.videoRotationAngle = angle }
             }
-            movieOutput.metadata = CaptureFormats.lookMetadata(look)
+            movieOutput.metadata = CaptureFormats.lookMetadata(look, gear: gear)
             recordingKind = .movieFile
             movieOutput.startRecording(to: CaptureFormats.temporaryMovieURL(), recordingDelegate: self)
         }
@@ -949,7 +1083,7 @@ extension CameraService: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             let snap = shared.snapshot()
             frames.push(pixelBuffer, isLog: snap.isLog)
             snap.recorder?.appendVideo(sampleBuffer, pixelBuffer: pixelBuffer,
-                                       look: snap.look, isLog: snap.isLog)
+                                       look: snap.look, gear: snap.gear, isLog: snap.isLog)
         } else if output === audioDataOutput {
             shared.snapshot().recorder?.appendAudio(sampleBuffer)
         }

@@ -23,14 +23,18 @@ final class PhotoProcessor {
     }
 
     /// Returns the data to save. Falls back to the original data whenever processing fails.
-    func process(data: Data, mode: CameraMode, look: LookPreset, aperture: Float) -> Output {
+    /// `cropToBody` is false for the processed companion of a ProRAW capture (the DNG stays 4:3).
+    func process(data: Data, mode: CameraMode, look: LookPreset, gear: GearSelection,
+                 aperture: Float, cropToBody: Bool = true) -> Output {
         let original = Output(data: data, thumbnail: LibrarySaver.photoThumbnail(from: data))
         let wantsPortrait = (mode == .portrait)
-        if !wantsPortrait && look == .native { return original }
+        let wantsCrop = cropToBody && abs(gear.body.photoAspect - 4.0 / 3.0) > 0.001
+        let wantsGear = !CaptureFormats.isNeutral(gear)
+        if !wantsPortrait && look == .native && !wantsCrop && !wantsGear { return original }
 
         // Orientation is baked into the pixels so every auxiliary image lines up.
         guard let base = CIImage(data: data, options: [.applyOrientationProperty: true]) else { return original }
-        let extent = base.extent
+        var extent = base.extent
         var image = base
         var modified = false
 
@@ -38,8 +42,16 @@ final class PhotoProcessor {
             image = blurred.cropped(to: extent)
             modified = true
         }
-        if look != .native {
-            image = renderer.apply(look, to: image, isLogSource: false)
+        if wantsCrop, let rect = cropRect(for: extent, aspect: gear.body.photoAspect) {
+            // Crop first so the lens vignette etc. follow the final frame; move the origin back to zero.
+            image = image.cropped(to: rect)
+                .transformed(by: CGAffineTransform(translationX: -rect.minX, y: -rect.minY))
+            extent = CGRect(x: 0, y: 0, width: rect.width, height: rect.height)
+            modified = true
+        }
+        if look != .native || wantsGear {
+            image = renderer.apply(look, gear: gear, aperture: wantsPortrait ? aperture : nil,
+                                   cheap: false, to: image, isLogSource: false)
             modified = true
         }
         guard modified else { return original }
@@ -48,6 +60,26 @@ final class PhotoProcessor {
         guard let cg = context.createCGImage(image, from: extent, format: .RGBA8, colorSpace: colorSpace),
               let encoded = encode(cg, sourceData: data) else { return original }
         return Output(data: encoded, thumbnail: LibrarySaver.photoThumbnail(from: encoded))
+    }
+
+    /// Centred crop rectangle (integral, even sizes) giving `aspect` (landscape w/h; inverted for portrait
+    /// images). Returns nil when the image already has that aspect.
+    private func cropRect(for extent: CGRect, aspect: CGFloat) -> CGRect? {
+        let w = extent.width, h = extent.height
+        guard w > 0, h > 0 else { return nil }
+        let target = (h > w) ? 1.0 / aspect : aspect
+        let current = w / h
+        if abs(current - target) < 0.002 { return nil }
+        var nw = w, nh = h
+        if current > target {
+            nw = (h * target / 2).rounded(.down) * 2
+        } else {
+            nh = (w / target / 2).rounded(.down) * 2
+        }
+        guard nw >= 2, nh >= 2 else { return nil }
+        let x = (extent.minX + (w - nw) / 2).rounded(.down)
+        let y = (extent.minY + (h - nh) / 2).rounded(.down)
+        return CGRect(x: x, y: y, width: nw, height: nh)
     }
 
     // MARK: Portrait
@@ -71,7 +103,8 @@ final class PhotoProcessor {
                                                      .applyOrientationProperty: true]) {
             set(fit(matte, to: target), "inputMatteImage")
         }
-        set(NSNumber(value: aperture), "inputAperture")
+        // The filter accepts roughly f/1 ... f/22.
+        set(NSNumber(value: min(max(aperture, 1.0), 22.0)), "inputAperture")
         set(NSNumber(value: 1.0), "inputScaleFactor")
         return filter.outputImage
     }
@@ -96,7 +129,11 @@ final class PhotoProcessor {
         ]
         if let src = CGImageSourceCreateWithData(sourceData as CFData, nil),
            let meta = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
-            if let exif = meta[kCGImagePropertyExifDictionary] { props[kCGImagePropertyExifDictionary] = exif }
+            if var exif = meta[kCGImagePropertyExifDictionary] as? [CFString: Any] {
+                exif[kCGImagePropertyExifPixelXDimension] = cg.width
+                exif[kCGImagePropertyExifPixelYDimension] = cg.height
+                props[kCGImagePropertyExifDictionary] = exif
+            }
             if let gps = meta[kCGImagePropertyGPSDictionary] { props[kCGImagePropertyGPSDictionary] = gps }
             if var tiff = meta[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
                 tiff[kCGImagePropertyTIFFOrientation] = 1
