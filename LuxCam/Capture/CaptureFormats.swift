@@ -29,7 +29,7 @@ enum CaptureFormats {
            let uw = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back) {
             return uw
         }
-        if f >= 100,
+        if f >= 96,
            let tele = AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back) {
             return tele
         }
@@ -40,21 +40,26 @@ enum CaptureFormats {
     /// 35mm-equivalent focal length of the device's native (zoom 1) field of view.
     /// Ultra wide / telephoto are derived from the field of view relative to the wide camera.
     static func baseFocalLength(of dev: AVCaptureDevice) -> Double {
-        let fallback: Double
-        let plausible: ClosedRange<Double>
         switch dev.deviceType {
-        case .builtInUltraWideCamera: fallback = 13; plausible = 8...18
-        case .builtInTelephotoCamera: fallback = 120; plausible = 60...200
-        default: return 24
+        case .builtInUltraWideCamera: return 13
+        case .builtInTripleCamera, .builtInDualWideCamera:
+            // Factor 1 = ultra wide (13mm); the first switch-over factor is the wide camera (24mm).
+            if let s = dev.virtualDeviceSwitchOverVideoZoomFactors.first?.doubleValue, s > 0 {
+                return 24 / s
+            }
+            return 13
+        case .builtInTelephotoCamera:
+            let fallback = 120.0
+            guard let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+                return fallback
+            }
+            let fw = Double(wide.activeFormat.videoFieldOfView)
+            let fd = Double(dev.activeFormat.videoFieldOfView)
+            guard fw > 1, fd > 1, fw < 179, fd < 179 else { return fallback }
+            let v = 24 * tan(fw * Double.pi / 360) / tan(fd * Double.pi / 360)
+            return (v.isFinite && (48.0...130.0).contains(v)) ? v : fallback
+        default: return 24      // wide, and .builtInDualCamera (factor 1 = wide 24mm)
         }
-        guard let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
-            return fallback
-        }
-        let fw = Double(wide.activeFormat.videoFieldOfView)
-        let fd = Double(dev.activeFormat.videoFieldOfView)
-        guard fw > 1, fd > 1, fw < 179, fd < 179 else { return fallback }
-        let v = 24 * tan(fw * Double.pi / 360) / tan(fd * Double.pi / 360)
-        return (v.isFinite && plausible.contains(v)) ? v : fallback
     }
 
     /// True when neither the body nor the lens adds any rendering character.

@@ -208,7 +208,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         guard mode != state.mode, !state.isRecording else { return }
         state.mode = mode
         if mode == .portrait || mode == .cinematic {
-            state.simulatedAperture = max(state.simulatedAperture, state.gear.lens.maxAperture)
+            state.simulatedAperture = max(state.simulatedAperture, max(state.gear.lens.maxAperture, 1))
         }
         let aperture = state.simulatedAperture
         sessionQueue.async { [self] in
@@ -268,7 +268,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     func set(simulatedAperture requested: Float) {
         var simulatedAperture = requested
         if state.mode == .portrait || state.mode == .cinematic {
-            simulatedAperture = max(simulatedAperture, state.gear.lens.maxAperture)
+            simulatedAperture = max(simulatedAperture, max(state.gear.lens.maxAperture, 1))
         }
         state.simulatedAperture = simulatedAperture
         sessionQueue.async { [self] in
@@ -282,14 +282,16 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     func set(gear requested: GearSelection) {
         let g = requested.normalized()
         let bodyChanged = g.body != state.gear.body
-        guard g != state.gear else { return }
+        guard !state.isRecording, g != state.gear else { return }
         state.gear = g
         shared.setGear(g)
-        if bodyChanged || !g.body.allows(state.look) {
+        if bodyChanged && (!g.body.allows(state.look) || (g.body.family != .native && state.look.family != g.body.family)) {
+            set(look: g.body.defaultLook)
+        } else if !g.body.allows(state.look) {
             set(look: g.body.defaultLook)
         }
         if state.mode == .portrait || state.mode == .cinematic {
-            state.simulatedAperture = max(state.simulatedAperture, g.lens.maxAperture)
+            state.simulatedAperture = max(state.simulatedAperture, max(g.lens.maxAperture, 1))
         }
         let aperture = state.simulatedAperture
         sessionQueue.async { [self] in
@@ -299,6 +301,13 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                 CinematicSupport.setAperture(aperture, input: input, device: dev)
             }
             // PHOTO / VIDEO: the gear may select another physical camera; PORTRAIT / CINEMATIC keep theirs.
+            if q.mode == .portrait {
+                if phase == .idle, let dev = device {
+                    applyGearZoom(on: dev)
+                    publishCapabilities(device: dev, cinematicActive: false)
+                }
+                return
+            }
             guard q.mode == .photo || q.mode == .video else { return }
             let target = CaptureFormats.captureDevice(for: q.mode, gear: g)
             if phase == .idle, let dev = device, let target = target, target.uniqueID == dev.uniqueID {
@@ -735,19 +744,23 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
 
     /// Residual zoom on the chosen physical camera for the gear's equivalent focal length.
     private func gearZoom(for dev: AVCaptureDevice) -> CGFloat {
-        guard q.mode == .photo || q.mode == .video else { return 1 }
+        guard q.mode == .photo || q.mode == .video || q.mode == .portrait else { return 1 }
         if q.mode == .video && q.video.codec.isRAW { return 1 }     // ProRes RAW: sensor native
         let f = q.gear.lens.equivalentFocalLength(on: q.gear.body)
         let base = CaptureFormats.baseFocalLength(of: dev)
         guard base > 0, f.isFinite else { return 1 }
         let fmt = dev.activeFormat
-        var z = min(max(1, CGFloat(f / base)), fmt.videoMaxZoomFactor)
+        let lo = max(1, dev.minAvailableVideoZoomFactor)
+        let hi = max(lo, min(fmt.videoMaxZoomFactor, dev.maxAvailableVideoZoomFactor))
+        var z = min(max(lo, CGFloat(f / base)), hi)
         // Snap to a native-resolution crop (e.g. 2x on the 48 MP main camera) when close enough.
-        let snaps = fmt.secondaryNativeResolutionZoomFactors
-        if let best = snaps.min(by: { abs($0 - z) < abs($1 - z) }), best > 0, abs(best / z - 1) <= 0.08 {
-            z = best
+        if !dev.isVirtualDevice {
+            let snaps = fmt.secondaryNativeResolutionZoomFactors
+            if let best = snaps.min(by: { abs($0 - z) < abs($1 - z) }), best > 0, abs(best / z - 1) <= 0.08 {
+                z = min(max(lo, best), hi)
+            }
         }
-        return max(1, z)
+        return z
     }
 
     private func applyGearZoom(on dev: AVCaptureDevice) {
