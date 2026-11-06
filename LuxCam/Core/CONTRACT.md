@@ -17,6 +17,7 @@ final class CameraService: NSObject, ObservableObject {
     func set(manual: ManualSettings)
     func set(video: VideoFormatSettings)
     func set(photoFormat: PhotoFormat)      // HEIF or Apple ProRAW (DNG); ProRAW ignores looks
+    func forgetAssets(_ ids: [String])      // drop deleted/missing assets from state.recentAssetIDs (+ persist)
     func set(gear: GearSelection)           // body + lens; normalises lens, enforces body.allows(look)
     func set(simulatedAperture: Float)
     func focus(at devicePoint: CGPoint)     // point of interest in device coordinates (0...1), resets focus to auto
@@ -57,3 +58,10 @@ struct CameraPreviewView: UIViewRepresentable {
 - Preview orients frames from the window scene's interface orientation.
 - Capture uses `AVCaptureDevice.RotationCoordinator` (`videoRotationAngleForHorizonLevelCapture`) at
   photo capture / record start. Never rotate the video data output connection.
+
+## Captured media history
+- Every successful save to Photos records the created asset's `localIdentifier`
+  (`PHAssetCreationRequest.placeholderForCreatedAsset`) at the front of `state.recentAssetIDs`,
+  persisted in UserDefaults key `LuxCam.recentAssetIDs` and restored in `CameraService.init`.
+- The in-app viewer (UI/MediaViewer) needs read access: it requests `PHPhotoLibrary.requestAuthorization(for: .readWrite)`
+  when first opened (limited access is fine for assets the app created).

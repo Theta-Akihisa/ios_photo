@@ -201,6 +201,8 @@ struct CameraState: Equatable {
     var previewIsLog = false
 
     var lastThumbnail: UIImage?
+    /// Photos-library local identifiers of assets captured by LuxCam, newest first (persisted, max 500).
+    var recentAssetIDs: [String] = []
     var errorMessage: String?
 }
 
