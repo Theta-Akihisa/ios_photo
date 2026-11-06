@@ -80,9 +80,15 @@ struct CameraPreviewView: UIViewRepresentable {
         var onTapViewPoint: ((CGPoint) -> Void)?
         weak var view: MTKView?
 
-        let device: MTLDevice?
-        private let commandQueue: MTLCommandQueue?
-        private let ciContext: CIContext?
+        // Shared across instances so recreating the view is cheap.
+        private static let sharedDevice: MTLDevice? = MTLCreateSystemDefaultDevice()
+        private static let sharedQueue: MTLCommandQueue? = sharedDevice?.makeCommandQueue()
+        private static let sharedContext: CIContext? = sharedDevice.map {
+            CIContext(mtlDevice: $0, options: [.cacheIntermediates: false])
+        }
+        var device: MTLDevice? { Self.sharedDevice }
+        private var commandQueue: MTLCommandQueue? { Self.sharedQueue }
+        private var ciContext: CIContext? { Self.sharedContext }
 
         // Change tracking so identical content is not re-rendered.
         private var lastBuffer: UnsafeMutableRawPointer?
@@ -107,14 +113,6 @@ struct CameraPreviewView: UIViewRepresentable {
             self.renderer = renderer
             self.onTap = onTap
             self.onTapViewPoint = onTapViewPoint
-            let dev = MTLCreateSystemDefaultDevice()
-            self.device = dev
-            self.commandQueue = dev?.makeCommandQueue()
-            if let dev = dev {
-                self.ciContext = CIContext(mtlDevice: dev, options: [.cacheIntermediates: false])
-            } else {
-                self.ciContext = nil
-            }
             super.init()
         }
 

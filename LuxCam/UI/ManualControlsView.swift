@@ -8,11 +8,20 @@ enum ManualChip: String, Identifiable {
     var id: String { rawValue }
 }
 
+/// UI state of the manual controls, owned by CameraScreen so it survives rotation.
+final class ManualControlsModel: ObservableObject {
+    @Published var selected: ManualChip?
+    @Published var showFormat = false
+    @Published var showGear = false
+}
+
 struct ManualControlsView: View {
     @ObservedObject var camera: CameraService
-    @State private var selected: ManualChip?
-    @State private var showFormat = false
-    @State private var showGear = false
+    @ObservedObject var model: ManualControlsModel
+    private var selected: ManualChip? {
+        get { model.selected }
+        nonmutating set { model.selected = newValue }
+    }
     /// Landscape control column: chips wrap into a grid and the dial uses the column width.
     var compact: Bool = false
 
@@ -74,13 +83,8 @@ struct ManualControlsView: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: selected)
-        .sheet(isPresented: $showFormat) { VideoFormatView(camera: camera) }
-        .sheet(isPresented: $showGear) { GearPickerView(camera: camera) }
-        .onChange(of: state.gear) { _, _ in
-            // The new lens may be slower than the current simulated aperture allows.
-            let lower = apertureLowerBound
-            if state.simulatedAperture < lower - 0.01 { camera.set(simulatedAperture: lower) }
-        }
+        .sheet(isPresented: $model.showFormat) { VideoFormatView(camera: camera) }
+        .sheet(isPresented: $model.showGear) { GearPickerView(camera: camera) }
     }
 
     // MARK: Chips
@@ -106,10 +110,11 @@ struct ManualControlsView: View {
 
     private func chipButton(_ chip: ManualChip) -> some View {
         Button {
+            if chip == .gear && state.isRecording { return }
             if chip == .format {
-                showFormat = true
+                model.showFormat = true
             } else if chip == .gear {
-                showGear = true
+                model.showGear = true
             } else {
                 selected = (selected == chip) ? nil : chip
             }
@@ -117,6 +122,8 @@ struct ManualControlsView: View {
             chipLabel(chip)
         }
         .buttonStyle(.plain)
+        .disabled(chip == .gear && state.isRecording)
+        .opacity(chip == .gear && state.isRecording ? 0.35 : 1)
     }
 
     private func chipTitle(_ chip: ManualChip) -> String {

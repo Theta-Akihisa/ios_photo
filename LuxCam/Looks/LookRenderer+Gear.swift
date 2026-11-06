@@ -63,7 +63,7 @@ extension LookRenderer {
             f.biasVector = CIVector(x: 0, y: 0, z: 0, w: 0)
             out = f.outputImage ?? out
         }
-        if abs(body.shadowMagenta) > eps {
+        if !cheap && abs(body.shadowMagenta) > eps {
             out = shadowTint(out, amount: body.shadowMagenta)
         }
         if !cheap && body.grain > eps {
@@ -80,7 +80,7 @@ extension LookRenderer {
             f.falloff = 0.5
             out = (f.outputImage ?? out).cropped(to: ext)
         }
-        if lens.sharpness > eps {
+        if !cheap && lens.sharpness > eps {
             let f = CIFilter.sharpenLuminance()
             f.inputImage = out
             f.sharpness = min(lens.sharpness * 0.6, 2)
@@ -141,7 +141,10 @@ extension LookRenderer {
         // Centre the noise around mid-grey, scaled by amount (soft light leaves 0.5 unchanged).
         let k = CGFloat(min(amount, 1))   // M8 (0.25) ≈ ±12% around mid-grey
         let n = CIFilter.colorMatrix()
-        n.inputImage = noise
+        // The generator image is infinite and deterministic: shift it randomly per call so the
+        // grain differs every frame instead of being a fixed pattern.
+        n.inputImage = noise.transformed(by: CGAffineTransform(translationX: CGFloat.random(in: 0..<512),
+                                                               y: CGFloat.random(in: 0..<512)))
         n.rVector = CIVector(x: k, y: 0, z: 0, w: 0)
         n.gVector = CIVector(x: 0, y: k, z: 0, w: 0)
         n.bVector = CIVector(x: 0, y: 0, z: k, w: 0)

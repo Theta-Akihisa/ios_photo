@@ -15,6 +15,9 @@ struct CameraScreen: View {
     @State private var reticleToken = UUID()
     @State private var flash = false
     @State private var dismissedError: String?
+    @StateObject private var manualModel = ManualControlsModel()
+    /// Portrait viewfinder slot (global coordinates), reported by the overlay layout.
+    @State private var slotFrame: CGRect = .zero
 
     private var state: CameraState { camera.state }
     private var isLandscape: Bool { verticalSizeClass == .compact }
@@ -22,14 +25,20 @@ struct CameraScreen: View {
     private let columnWidth: CGFloat = 270
 
     var body: some View {
-        ZStack {
-            Theme.black.ignoresSafeArea()
-            if isLandscape { landscapeLayout } else { portraitLayout }
-            errorBanner
-            // Shutter flash.
-            Color.black.opacity(flash ? 1 : 0)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
+        GeometryReader { outer in
+            let insets = outer.safeAreaInsets
+            ZStack {
+                Theme.black.ignoresSafeArea()
+                // One preview instance for both orientations: only its frame changes.
+                previewLayer(insets: insets)
+                    .ignoresSafeArea()
+                if isLandscape { landscapeOverlay } else { portraitOverlay }
+                errorBanner
+                // Shutter flash.
+                Color.black.opacity(flash ? 1 : 0)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
         }
         .animation(.easeInOut(duration: 0.25), value: state.mode)
         .sheet(isPresented: $showGear) { GearPickerView(camera: camera) }
@@ -50,54 +59,34 @@ struct CameraScreen: View {
     /// Portrait photo aspect (width / height) of the emulated body: 3:2 -> 2:3, 4:3 -> 3:4.
     private var portraitPhotoAspect: CGFloat { 1 / state.gear.body.photoAspect }
 
-    // MARK: Portrait layout
+    // MARK: Portrait overlay
 
-    private var portraitLayout: some View {
-        ZStack {
-            // VIDEO / CINEMATIC: like the stock Camera app, the 9:16 preview sits behind the
-            // whole UI and the bars float over it on a translucent background.
-            if state.mode.isVideo {
-                GeometryReader { geo in
-                    fittedPreview(in: geo.size, aspect: 9.0 / 16.0, swipeAxis: .horizontal)
-                }
-                .ignoresSafeArea()
-                .transition(.opacity)
-            }
-            VStack(spacing: 0) {
-                TopBarView(state: state, onGearTap: { showGear = true })
-                    .background(barBackground)
-                    .fixedSize(horizontal: false, vertical: true)
-                portraitViewfinderSlot
-                controls
-                    .background(barBackground.ignoresSafeArea(edges: .bottom))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
-    /// The flexible area between the top bar and the controls. It always takes exactly the
-    /// space that is left, so the preview can never push the controls off screen.
-    @ViewBuilder
-    private var portraitViewfinderSlot: some View {
-        if state.mode.isVideo {
-            // The preview is drawn behind (see portraitLayout); this slot only reserves space and shows
-            // the HUD. Hit testing is off so taps and swipes reach the preview underneath.
+    private var portraitOverlay: some View {
+        VStack(spacing: 0) {
+            TopBarView(state: state, onGearTap: { showGear = true })
+                .background(barBackground)
+                .fixedSize(horizontal: false, vertical: true)
+            // The flexible area between the top bar and the controls. It only reserves space and
+            // reports its frame; the persistent preview is drawn underneath.
             Color.clear
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay(alignment: .bottom) { ViewfinderHUD(state: state) }
+                .background(
+                    GeometryReader { g in
+                        Color.clear.preference(key: SlotFramePreference.self, value: g.frame(in: .global))
+                    })
                 .allowsHitTesting(false)
-        } else {
-            GeometryReader { geo in
-                fittedPreview(in: geo.size, aspect: portraitPhotoAspect, swipeAxis: .horizontal)
-                    .overlay(alignment: .bottom) { ViewfinderHUD(state: state) }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            controls
+                .background(barBackground.ignoresSafeArea(edges: .bottom))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .onPreferenceChange(SlotFramePreference.self) { f in
+            if f != slotFrame { slotFrame = f }
         }
     }
 
     private var controls: some View {
         VStack(spacing: 8) {
-            ManualControlsView(camera: camera)
+            ManualControlsView(camera: camera, model: manualModel)
             ModeStrip(camera: camera)
             bottomBar
         }
@@ -115,47 +104,14 @@ struct CameraScreen: View {
         .padding(.bottom, 6)
     }
 
-    // MARK: Landscape layout
+    // MARK: Landscape overlay
 
-    private var landscapeLayout: some View {
-        GeometryReader { geo in
-            let insets = geo.safeAreaInsets
-            ZStack {
-                // Only the preview ignores the safe area.
-                landscapePreviewLayer(insets: insets)
-                    .ignoresSafeArea()
-                HStack(spacing: 0) {
-                    Spacer(minLength: 0)
-                    landscapeColumn
-                        .frame(width: columnWidth)
-                        .background(barBackground.ignoresSafeArea())
-                }
-            }
-        }
-    }
-
-    private func landscapePreviewLayer(insets: EdgeInsets) -> some View {
-        GeometryReader { full in
-            if state.mode.isVideo {
-                // Full-bleed 16:9 behind the translucent column.
-                let area = CGSize(width: max(full.size.width - columnWidth - insets.trailing, 1),
-                                  height: full.size.height)
-                ZStack(alignment: .topLeading) {
-                    fittedPreview(in: full.size, aspect: 16.0 / 9.0, swipeAxis: .vertical)
-                    Color.clear
-                        .frame(width: area.width, height: area.height)
-                        .overlay(alignment: .bottom) { ViewfinderHUD(state: state) }
-                        .allowsHitTesting(false)
-                }
-            } else {
-                let leading = insets.leading
-                let area = CGSize(width: max(full.size.width - columnWidth - insets.trailing - leading, 1),
-                                  height: full.size.height)
-                fittedPreview(in: area, aspect: state.gear.body.photoAspect, swipeAxis: .vertical)
-                    .overlay(alignment: .bottom) { ViewfinderHUD(state: state) }
-                    .frame(width: area.width, height: area.height)
-                    .offset(x: leading)
-            }
+    private var landscapeOverlay: some View {
+        HStack(spacing: 0) {
+            Spacer(minLength: 0)
+            landscapeColumn
+                .frame(width: columnWidth)
+                .background(barBackground.ignoresSafeArea())
         }
     }
 
@@ -164,7 +120,7 @@ struct CameraScreen: View {
             LandscapeInfoView(state: state, onGearTap: { showGear = true })
                 .padding(.top, 6)
             ScrollView(.vertical, showsIndicators: false) {
-                ManualControlsView(camera: camera, compact: true)
+                ManualControlsView(camera: camera, model: manualModel, compact: true)
                     .frame(maxWidth: .infinity)
             }
             .frame(maxHeight: .infinity)
@@ -191,21 +147,56 @@ struct CameraScreen: View {
 
     // MARK: Viewfinder
 
-    /// Lays out the preview at `aspect` (width / height), as large as fits in `size`, centred.
-    /// The frame is computed explicitly, so the preview never influences the parent's layout.
-    private func fittedPreview(in size: CGSize, aspect: CGFloat, swipeAxis: Axis) -> some View {
-        let fitted: CGSize
-        if size.width / max(size.height, 1) > aspect {
-            fitted = CGSize(width: size.height * aspect, height: size.height)
+    /// Largest rect of `aspect` (width / height) that fits in `area`, centred.
+    private func fitted(in area: CGRect, aspect: CGFloat) -> CGRect {
+        let size: CGSize
+        if area.width / max(area.height, 1) > aspect {
+            size = CGSize(width: area.height * aspect, height: area.height)
         } else {
-            fitted = CGSize(width: size.width, height: size.width / aspect)
+            size = CGSize(width: area.width, height: area.width / aspect)
         }
-        return previewStack
-            .frame(width: fitted.width, height: fitted.height)
-            .clipped()
-            .contentShape(Rectangle())
-            .simultaneousGesture(swipeGesture(axis: swipeAxis))
-            .position(x: size.width / 2, y: size.height / 2)
+        return CGRect(x: area.midX - size.width / 2, y: area.midY - size.height / 2,
+                      width: size.width, height: size.height)
+    }
+
+    /// Preview and HUD rects in the full-screen coordinate space of `previewLayer`.
+    private func layoutRects(full: CGSize, insets: EdgeInsets, origin: CGPoint) -> (preview: CGRect, hud: CGRect) {
+        let screen = CGRect(origin: .zero, size: full)
+        if isLandscape {
+            let area = CGRect(x: insets.leading, y: 0,
+                              width: max(full.width - columnWidth - insets.trailing - insets.leading, 1),
+                              height: full.height)
+            let aspect: CGFloat = state.mode.isVideo ? 16.0 / 9.0 : state.gear.body.photoAspect
+            let r = fitted(in: area, aspect: aspect)
+            return (r, r)
+        }
+        var slot = slotFrame.offsetBy(dx: -origin.x, dy: -origin.y)
+        if slotFrame == .zero || slot.width < 1 || slot.height < 1 { slot = screen }
+        if state.mode.isVideo {
+            return (fitted(in: screen, aspect: 9.0 / 16.0), slot)
+        }
+        let r = fitted(in: slot, aspect: portraitPhotoAspect)
+        return (r, r)
+    }
+
+    /// The single, persistent preview (plus HUD). Its frame is computed from orientation and mode.
+    private func previewLayer(insets: EdgeInsets) -> some View {
+        GeometryReader { full in
+            let origin = full.frame(in: .global).origin
+            let r = layoutRects(full: full.size, insets: insets, origin: origin)
+            ZStack {
+                previewStack
+                    .frame(width: r.preview.width, height: r.preview.height)
+                    .clipped()
+                    .contentShape(Rectangle())
+                    .simultaneousGesture(swipeGesture(axis: isLandscape ? .vertical : .horizontal))
+                    .position(x: r.preview.midX, y: r.preview.midY)
+                ViewfinderHUD(state: state)
+                    .frame(width: r.hud.width, height: r.hud.height, alignment: .bottom)
+                    .position(x: r.hud.midX, y: r.hud.midY)
+                    .allowsHitTesting(false)
+            }
+        }
     }
 
     private var previewStack: some View {
@@ -311,4 +302,9 @@ struct CameraScreen: View {
             .transition(.opacity)
         }
     }
+}
+
+private struct SlotFramePreference: PreferenceKey {
+    static var defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
 }

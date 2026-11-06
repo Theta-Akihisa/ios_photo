@@ -81,6 +81,8 @@ struct TopBarView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .disabled(state.isRecording)
+                .opacity(state.isRecording ? 0.35 : 1)
                 .accessibilityLabel("ギア選択")
                 Text(lookLabel(state))
                     .luxCaps(9, color: Theme.dim)
@@ -119,6 +121,8 @@ struct LandscapeInfoView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .disabled(state.isRecording)
+                .opacity(state.isRecording ? 0.35 : 1)
                 .accessibilityLabel("ギア選択")
                 Text(lookLabel(state))
                     .luxCaps(8, color: Theme.dim)
