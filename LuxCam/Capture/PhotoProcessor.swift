@@ -57,15 +57,22 @@ final class PhotoProcessor {
                                                             .applyOrientationProperty: true]) else { return nil }
         let target = base.extent
 
-        let filter = CIFilter.depthBlurEffect()
-        filter.inputImage = base
-        filter.disparityImage = fit(disparity, to: target)
+        // CIDepthBlurEffect has no typed factory in CIFilterBuiltins, so it is created by name.
+        // Every key is checked against `inputKeys` first: setting an unknown key raises an
+        // Objective-C exception (crash) instead of failing gracefully.
+        guard let filter = CIFilter(name: "CIDepthBlurEffect") else { return nil }
+        let keys = Set(filter.inputKeys)
+        func set(_ value: Any, _ key: String) {
+            if keys.contains(key) { filter.setValue(value, forKey: key) }
+        }
+        set(base, kCIInputImageKey)
+        set(fit(disparity, to: target), "inputDisparityImage")
         if let matte = CIImage(data: data, options: [.auxiliaryPortraitEffectsMatte: true,
                                                      .applyOrientationProperty: true]) {
-            filter.matteImage = fit(matte, to: target)
+            set(fit(matte, to: target), "inputMatteImage")
         }
-        filter.aperture = aperture
-        filter.scaleFactor = 1.0
+        set(NSNumber(value: aperture), "inputAperture")
+        set(NSNumber(value: 1.0), "inputScaleFactor")
         return filter.outputImage
     }
 
