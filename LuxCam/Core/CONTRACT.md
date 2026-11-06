@@ -46,10 +46,11 @@ struct CameraPreviewView: UIViewRepresentable {
 `@main struct LuxCamApp`, `ContentView` owning `@StateObject var camera = CameraService(lookRenderer: LookRenderer.shared)`.
 
 ## Gear (Core/Gear.swift)
-- Lens focal length (35mm equiv.) selects the PHYSICAL back camera (ultra wide / wide / telephoto)
+- `lens.equivalentFocalLength(on: body)` (focal length × body cropFactor; M8 = 1.33, Hasselblad = 0.79) selects the PHYSICAL back camera (ultra wide / wide / telephoto)
   plus a residual `videoZoomFactor` in PHOTO and VIDEO. PORTRAIT and CINEMATIC keep their own devices.
 - Body `photoAspect` crops photos (not ProRAW DNGs) and masks the preview.
-- Lens `character` is applied after the look via `LookRendering.apply(_:lens:aperture:cheap:to:isLogSource:)`.
+- Body `character` + lens `character` are applied after the look via
+  `LookRendering.apply(_:gear:aperture:cheap:to:isLogSource:)`.
 
 ## Orientation
 - UI supports portrait + both landscapes. Landscape layout is chosen with `verticalSizeClass == .compact`.

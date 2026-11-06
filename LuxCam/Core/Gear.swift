@@ -21,9 +21,25 @@ struct LensCharacter: Equatable {
     static let neutral = LensCharacter()
 }
 
+/// Sensor / colour-science character of a body, applied together with the lens character.
+struct BodyCharacter: Equatable {
+    /// Added to saturation (e.g. 0.1 = +10 %).
+    var saturation: Float = 0
+    /// Added to contrast around mid-grey.
+    var contrast: Float = 0
+    /// Positive = warmer, negative = cooler (small values, ~±0.1).
+    var warmth: Float = 0
+    /// Positive = magenta cast in the shadows (M8 IR sensitivity), negative = green.
+    var shadowMagenta: Float = 0
+    /// 0...1 luminance grain.
+    var grain: Float = 0
+
+    static let neutral = BodyCharacter()
+}
+
 enum CameraBody: String, CaseIterable, Identifiable, Codable {
     case iphone
-    case leicaM11, leicaM11Monochrom, leicaQ3, leicaSL3
+    case leicaM11, leicaM11Monochrom, leicaM10, leicaM9, leicaM8, leicaSL3, leicaSL3S
     case hasselbladX2D, hasselblad907X
 
     var id: String { rawValue }
@@ -31,7 +47,8 @@ enum CameraBody: String, CaseIterable, Identifiable, Codable {
     var family: LookFamily {
         switch self {
         case .iphone: return .native
-        case .leicaM11, .leicaM11Monochrom, .leicaQ3, .leicaSL3: return .leica
+        case .leicaM11, .leicaM11Monochrom, .leicaM10, .leicaM9, .leicaM8, .leicaSL3, .leicaSL3S:
+            return .leica
         case .hasselbladX2D, .hasselblad907X: return .hasselblad
         }
     }
@@ -41,8 +58,11 @@ enum CameraBody: String, CaseIterable, Identifiable, Codable {
         case .iphone: return "iPhone"
         case .leicaM11: return "M11"
         case .leicaM11Monochrom: return "M11 Monochrom"
-        case .leicaQ3: return "Q3"
+        case .leicaM10: return "M10"
+        case .leicaM9: return "M9"
+        case .leicaM8: return "M8"
         case .leicaSL3: return "SL3"
+        case .leicaSL3S: return "SL3-S"
         case .hasselbladX2D: return "X2D 100C"
         case .hasselblad907X: return "907X CFV 100C"
         }
@@ -54,10 +74,39 @@ enum CameraBody: String, CaseIterable, Identifiable, Codable {
         case .iphone: return "iPhone"
         case .leicaM11: return "M11"
         case .leicaM11Monochrom: return "M11 MONO"
-        case .leicaQ3: return "Q3"
+        case .leicaM10: return "M10"
+        case .leicaM9: return "M9"
+        case .leicaM8: return "M8"
         case .leicaSL3: return "SL3"
+        case .leicaSL3S: return "SL3-S"
         case .hasselbladX2D: return "X2D"
         case .hasselblad907X: return "907X"
+        }
+    }
+
+    /// One-line Japanese description for the picker.
+    var subtitle: String {
+        switch self {
+        case .iphone: return "iPhone 純正の描写"
+        case .leicaM11: return "60MP フルサイズ CMOS・現代的でクリーン"
+        case .leicaM11Monochrom: return "モノクロ専用センサー・豊かな階調"
+        case .leicaM10: return "24MP CMOS・落ち着いたクラシックな色"
+        case .leicaM9: return "18MP CCD・濃密で深い色乗り"
+        case .leicaM8: return "10MP CCD（APS-H ×1.33）・独特の発色と粒状感"
+        case .leicaSL3: return "60MP ミラーレス・高精細でニュートラル"
+        case .leicaSL3S: return "24MP ミラーレス・動画向け、ニュートラル"
+        case .hasselbladX2D: return "100MP 中判・HNCS 風の自然な色"
+        case .hasselblad907X: return "100MP 中判デジタルバック・柔らかな階調"
+        }
+    }
+
+    /// Sensor size relative to 35mm full frame (35mm-equivalent = focal length × cropFactor).
+    var cropFactor: Double {
+        switch self {
+        case .iphone: return 1.0          // iPhone lenses are already given as equivalents
+        case .leicaM8: return 1.33        // APS-H
+        case .hasselbladX2D, .hasselblad907X: return 0.79   // 44×33 medium format
+        default: return 1.0
         }
     }
 
@@ -71,15 +120,34 @@ enum CameraBody: String, CaseIterable, Identifiable, Codable {
 
     var isMonochrome: Bool { self == .leicaM11Monochrom }
 
+    var character: BodyCharacter {
+        switch self {
+        case .iphone, .leicaSL3, .leicaSL3S, .hasselbladX2D:
+            return .neutral
+        case .leicaM11:
+            return BodyCharacter(saturation: 0.02, contrast: 0.02)
+        case .leicaM11Monochrom:
+            return BodyCharacter(contrast: 0.04, grain: 0.08)
+        case .leicaM10:
+            return BodyCharacter(saturation: -0.02, contrast: 0.03, warmth: 0.03, grain: 0.05)
+        case .leicaM9:
+            // CCD: dense, rich colour; deeper reds/blues, a touch more contrast.
+            return BodyCharacter(saturation: 0.12, contrast: 0.08, warmth: 0.02, grain: 0.12)
+        case .leicaM8:
+            // CCD with weak IR filtering: slightly magenta shadows, more noise.
+            return BodyCharacter(saturation: 0.08, contrast: 0.06, warmth: -0.01, shadowMagenta: 0.06, grain: 0.25)
+        case .hasselblad907X:
+            return BodyCharacter(saturation: -0.03, contrast: -0.03, warmth: 0.01)
+        }
+    }
+
     var defaultLook: LookPreset {
         switch self {
         case .iphone: return .native
-        case .leicaM11: return .leicaClassic
+        case .leicaM11, .leicaM10, .leicaM9, .leicaM8: return .leicaClassic
         case .leicaM11Monochrom: return .leicaMonochrome
-        case .leicaQ3: return .leicaContemporary
-        case .leicaSL3: return .leicaContemporary
-        case .hasselbladX2D: return .hasselbladNatural
-        case .hasselblad907X: return .hasselbladNatural
+        case .leicaSL3, .leicaSL3S: return .leicaContemporary
+        case .hasselbladX2D, .hasselblad907X: return .hasselbladNatural
         }
     }
 
@@ -92,10 +160,11 @@ enum CameraBody: String, CaseIterable, Identifiable, Codable {
     var lenses: [LensProfile] {
         switch self {
         case .iphone: return [.iphone13, .iphone24, .iphone48, .iphone120]
-        case .leicaM11, .leicaM11Monochrom:
+        case .leicaM11, .leicaM11Monochrom, .leicaM10, .leicaM9, .leicaM8:
             return [.summicronM28, .summiluxM35, .noctiluxM50, .apoSummicronM90]
-        case .leicaQ3: return [.q3Summilux28]
-        case .leicaSL3: return [.slApoSummicron35, .slApoSummicron50, .summiluxM35, .noctiluxM50]
+        case .leicaSL3, .leicaSL3S:
+            // SL lenses plus M lenses via the M-L adapter.
+            return [.slApoSummicron35, .slApoSummicron50, .summicronM28, .summiluxM35, .noctiluxM50, .apoSummicronM90]
         case .hasselbladX2D, .hasselblad907X: return [.xcd25V, .xcd38V, .xcd55V, .xcd90V]
         }
     }
@@ -103,9 +172,9 @@ enum CameraBody: String, CaseIterable, Identifiable, Codable {
     var defaultLens: LensProfile {
         switch self {
         case .iphone: return .iphone24
-        case .leicaM11, .leicaM11Monochrom: return .summiluxM35
-        case .leicaQ3: return .q3Summilux28
-        case .leicaSL3: return .slApoSummicron50
+        case .leicaM11, .leicaM11Monochrom, .leicaM10, .leicaM9: return .summiluxM35
+        case .leicaM8: return .summicronM28      // ≈ 37mm equivalent on APS-H
+        case .leicaSL3, .leicaSL3S: return .slApoSummicron50
         case .hasselbladX2D, .hasselblad907X: return .xcd55V
         }
     }
@@ -121,11 +190,9 @@ enum LensProfile: String, CaseIterable, Identifiable, Codable {
     case iphone13, iphone24, iphone48, iphone120
     // Leica M
     case summicronM28, summiluxM35, noctiluxM50, apoSummicronM90
-    // Leica Q3 (fixed lens)
-    case q3Summilux28
     // Leica SL
     case slApoSummicron35, slApoSummicron50
-    // Hasselblad XCD (medium format, ×0.79 crop already applied to focalLength35mm)
+    // Hasselblad XCD (medium format; real focal lengths, body cropFactor 0.79)
     case xcd25V, xcd38V, xcd55V, xcd90V
 
     var id: String { rawValue }
@@ -140,7 +207,6 @@ enum LensProfile: String, CaseIterable, Identifiable, Codable {
         case .summiluxM35: return "Summilux-M 35 f/1.4"
         case .noctiluxM50: return "Noctilux-M 50 f/0.95"
         case .apoSummicronM90: return "APO-Summicron-M 90 f/2"
-        case .q3Summilux28: return "Summilux 28 f/1.7 ASPH"
         case .slApoSummicron35: return "APO-Summicron-SL 35 f/2"
         case .slApoSummicron50: return "APO-Summicron-SL 50 f/2"
         case .xcd25V: return "XCD 25V f/2.5"
@@ -161,7 +227,6 @@ enum LensProfile: String, CaseIterable, Identifiable, Codable {
         case .summiluxM35: return "SUMMILUX 35"
         case .noctiluxM50: return "NOCTILUX 50"
         case .apoSummicronM90: return "APO 90"
-        case .q3Summilux28: return "SUMMILUX 28"
         case .slApoSummicron35: return "APO-SL 35"
         case .slApoSummicron50: return "APO-SL 50"
         case .xcd25V: return "XCD 25V"
@@ -171,22 +236,27 @@ enum LensProfile: String, CaseIterable, Identifiable, Codable {
         }
     }
 
-    /// 35mm-equivalent focal length used to pick the iPhone camera and zoom factor.
-    var focalLength35mm: Double {
+    /// Real focal length in mm (for iPhone lenses: the 35mm-equivalent marketing value).
+    var focalLength: Double {
         switch self {
         case .iphone13: return 13
         case .iphone24: return 24
         case .iphone48: return 48
         case .iphone120: return 120
-        case .summicronM28, .q3Summilux28: return 28
+        case .summicronM28: return 28
         case .summiluxM35, .slApoSummicron35: return 35
         case .noctiluxM50, .slApoSummicron50: return 50
         case .apoSummicronM90: return 90
-        case .xcd25V: return 20
-        case .xcd38V: return 30
-        case .xcd55V: return 43
-        case .xcd90V: return 71
+        case .xcd25V: return 25
+        case .xcd38V: return 38
+        case .xcd55V: return 55
+        case .xcd90V: return 90
         }
+    }
+
+    /// 35mm-equivalent focal length on `body`; selects the iPhone camera and zoom factor.
+    func equivalentFocalLength(on body: CameraBody) -> Double {
+        focalLength * body.cropFactor
     }
 
     /// Widest aperture; lower bound of the simulated-aperture dial (PORTRAIT / CINEMATIC).
@@ -201,7 +271,6 @@ enum LensProfile: String, CaseIterable, Identifiable, Codable {
         case .summiluxM35: return 1.4
         case .noctiluxM50: return 0.95
         case .apoSummicronM90: return 2.0
-        case .q3Summilux28: return 1.7
         case .slApoSummicron35, .slApoSummicron50: return 2.0
         case .xcd25V, .xcd38V, .xcd55V, .xcd90V: return 2.5
         }
@@ -219,8 +288,6 @@ enum LensProfile: String, CaseIterable, Identifiable, Codable {
             return LensCharacter(vignette: 0.6, bloom: 0.45, sharpness: 0.15, softnessWideOpen: 0.7)
         case .apoSummicronM90:
             return LensCharacter(vignette: 0.2, bloom: 0.0, sharpness: 0.7, softnessWideOpen: 0.05)
-        case .q3Summilux28:
-            return LensCharacter(vignette: 0.3, bloom: 0.1, sharpness: 0.5, softnessWideOpen: 0.2)
         case .slApoSummicron35, .slApoSummicron50:
             return LensCharacter(vignette: 0.15, bloom: 0.0, sharpness: 0.65, softnessWideOpen: 0.05)
         case .xcd25V, .xcd38V, .xcd55V, .xcd90V:

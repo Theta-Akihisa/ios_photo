@@ -232,16 +232,17 @@ protocol LookRendering: AnyObject {
     /// Must be thread-safe (called from capture queue and render thread).
     func apply(_ preset: LookPreset, to image: CIImage, isLogSource: Bool) -> CIImage
 
-    /// Applies the colour look and then the lens rendering character (vignette, bloom, sharpness).
-    /// `aperture` is the simulated f-number (used for wide-open softness); pass nil when not relevant.
-    /// `cheap` = true for real-time paths that must stay fast (e.g. baked 4K recording: no bloom).
-    func apply(_ preset: LookPreset, lens: LensCharacter?, aperture: Float?, cheap: Bool,
+    /// Applies the colour look, then the body character (saturation/contrast/warmth/shadow tint/grain)
+    /// and the lens character (vignette, bloom, sharpness, wide-open softness).
+    /// `gear` nil = look only. `aperture` is the simulated f-number (wide-open softness); nil = ignore.
+    /// `cheap` = true for real-time paths that must stay fast (baked 4K recording: no bloom, no grain).
+    func apply(_ preset: LookPreset, gear: GearSelection?, aperture: Float?, cheap: Bool,
                to image: CIImage, isLogSource: Bool) -> CIImage
 }
 
 extension LookRendering {
-    /// Default: lens character ignored (modules can migrate independently).
-    func apply(_ preset: LookPreset, lens: LensCharacter?, aperture: Float?, cheap: Bool,
+    /// Default: gear ignored (modules can migrate independently).
+    func apply(_ preset: LookPreset, gear: GearSelection?, aperture: Float?, cheap: Bool,
                to image: CIImage, isLogSource: Bool) -> CIImage {
         apply(preset, to: image, isLogSource: isLogSource)
     }
