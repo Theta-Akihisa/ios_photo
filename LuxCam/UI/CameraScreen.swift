@@ -18,10 +18,23 @@ struct CameraScreen: View {
     var body: some View {
         ZStack {
             Theme.black.ignoresSafeArea()
+            // VIDEO / CINEMATIC: like the stock Camera app, the 9:16 preview sits behind the
+            // whole UI and the bars float over it on a translucent background.
+            if state.mode.isVideo {
+                GeometryReader { geo in
+                    fittedPreview(in: geo.size, aspect: 9.0 / 16.0)
+                }
+                .ignoresSafeArea()
+                .transition(.opacity)
+            }
             VStack(spacing: 0) {
                 TopBarView(state: state)
-                viewfinder
+                    .background(barBackground)
+                    .fixedSize(horizontal: false, vertical: true)
+                viewfinderSlot
                 controls
+                    .background(barBackground.ignoresSafeArea(edges: .bottom))
+                    .fixedSize(horizontal: false, vertical: true)
             }
             errorBanner
             // Shutter flash.
@@ -29,6 +42,7 @@ struct CameraScreen: View {
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
         }
+        .animation(.easeInOut(duration: 0.25), value: state.mode)
         .onChange(of: state.isCapturingPhoto) { _, capturing in
             guard capturing else { return }
             flash = true
@@ -38,22 +52,48 @@ struct CameraScreen: View {
         }
     }
 
+    /// Opaque black in photo modes, translucent over the full-bleed video preview.
+    private var barBackground: Color {
+        state.mode.isVideo ? Color.black.opacity(0.45) : Theme.black
+    }
+
     // MARK: Viewfinder
 
-    /// width / height
-    private var aspect: CGFloat { state.mode.isVideo ? 9.0 / 16.0 : 3.0 / 4.0 }
-
-    private var viewfinder: some View {
-        ZStack {
-            previewStack
-                .aspectRatio(aspect, contentMode: state.mode.isVideo ? .fill : .fit)
+    /// The flexible area between the top bar and the controls. It always takes exactly the
+    /// space that is left, so the preview can never push the controls off screen.
+    @ViewBuilder
+    private var viewfinderSlot: some View {
+        if state.mode.isVideo {
+            // The preview is drawn behind (see body); this slot only reserves space and shows
+            // the HUD. Hit testing is off so taps and swipes reach the preview underneath.
+            Color.clear
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(alignment: .bottom) { ViewfinderHUD(state: state) }
+                .allowsHitTesting(false)
+        } else {
+            GeometryReader { geo in
+                fittedPreview(in: geo.size, aspect: 3.0 / 4.0)
+                    .overlay(alignment: .bottom) { ViewfinderHUD(state: state) }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .overlay(alignment: .bottom) { ViewfinderHUD(state: state) }
-        .clipped()
-        .contentShape(Rectangle())
-        .simultaneousGesture(swipeGesture)
-        .animation(.easeInOut(duration: 0.25), value: state.mode)
+    }
+
+    /// Lays out the preview at `aspect` (width / height), as large as fits in `size`, centred.
+    /// The frame is computed explicitly, so the preview never influences the parent's layout.
+    private func fittedPreview(in size: CGSize, aspect: CGFloat) -> some View {
+        let fitted: CGSize
+        if size.width / max(size.height, 1) > aspect {
+            fitted = CGSize(width: size.height * aspect, height: size.height)
+        } else {
+            fitted = CGSize(width: size.width, height: size.width / aspect)
+        }
+        return previewStack
+            .frame(width: fitted.width, height: fitted.height)
+            .clipped()
+            .contentShape(Rectangle())
+            .simultaneousGesture(swipeGesture)
+            .position(x: size.width / 2, y: size.height / 2)
     }
 
     private var previewStack: some View {
@@ -102,7 +142,7 @@ struct CameraScreen: View {
             bottomBar
         }
         .padding(.top, 10)
-        .background(Theme.black)
+        // Background is applied by the caller (opaque in photo modes, translucent in video).
     }
 
     private var bottomBar: some View {
