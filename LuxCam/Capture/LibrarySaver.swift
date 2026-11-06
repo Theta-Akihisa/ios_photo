@@ -8,8 +8,11 @@ import UIKit
 
 enum LibrarySaver {
 
+    private final class IDBox: @unchecked Sendable { var id: String? }
+
     /// Saves `data` as the primary photo; `rawDNG` (Apple ProRAW) is stored as the alternate resource.
-    static func savePhoto(data: Data, rawDNG: Data? = nil, isDNG: Bool = false, completion: @escaping (Bool, Error?) -> Void) {
+    static func savePhoto(data: Data, rawDNG: Data? = nil, isDNG: Bool = false, completion: @escaping (Bool, Error?, String?) -> Void) {
+        let box = IDBox()
         PHPhotoLibrary.shared().performChanges({
             let request = PHAssetCreationRequest.forAsset()
             let mainOptions = PHAssetResourceCreationOptions()
@@ -20,21 +23,24 @@ enum LibrarySaver {
                 rawOptions.uniformTypeIdentifier = "com.adobe.raw-image"
                 request.addResource(with: .alternatePhoto, data: raw, options: rawOptions)
             }
+            box.id = request.placeholderForCreatedAsset?.localIdentifier
         }, completionHandler: { ok, error in
-            completion(ok, error)
+            completion(ok, error, ok ? box.id : nil)
         })
     }
 
     /// Saves the movie (moving the file into the library) and removes the temp file afterwards.
-    static func saveVideo(url: URL, completion: @escaping (Bool, Error?) -> Void) {
+    static func saveVideo(url: URL, completion: @escaping (Bool, Error?, String?) -> Void) {
+        let box = IDBox()
         PHPhotoLibrary.shared().performChanges({
             let options = PHAssetResourceCreationOptions()
             options.shouldMoveFile = true
             let request = PHAssetCreationRequest.forAsset()
             request.addResource(with: .video, fileURL: url, options: options)
+            box.id = request.placeholderForCreatedAsset?.localIdentifier
         }, completionHandler: { ok, error in
             try? FileManager.default.removeItem(at: url)
-            completion(ok, error)
+            completion(ok, error, ok ? box.id : nil)
         })
     }
 

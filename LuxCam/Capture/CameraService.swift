@@ -128,6 +128,29 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     // MARK: Main-thread only
     private var recordTimer: Timer?
 
+    // MARK: - Captured media history
+
+    private static let recentAssetsKey = "LuxCam.recentAssetIDs"
+    private static let recentAssetsCap = 500
+
+    /// Main thread only.
+    private func recordAsset(_ id: String) {
+        var ids = state.recentAssetIDs
+        ids.removeAll { $0 == id }
+        ids.insert(id, at: 0)
+        if ids.count > Self.recentAssetsCap { ids = Array(ids.prefix(Self.recentAssetsCap)) }
+        state.recentAssetIDs = ids
+        UserDefaults.standard.set(ids, forKey: Self.recentAssetsKey)
+    }
+
+    /// Main thread only. Drops the given IDs from the history (e.g. after deletion).
+    func forgetAssets(_ ids: [String]) {
+        let drop = Set(ids)
+        let ids = state.recentAssetIDs.filter { !drop.contains($0) }
+        state.recentAssetIDs = ids
+        UserDefaults.standard.set(ids, forKey: Self.recentAssetsKey)
+    }
+
     // MARK: - Init
 
     init(lookRenderer: LookRendering) {
@@ -136,6 +159,10 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         self.ciContext = ctx
         self.photoProcessor = PhotoProcessor(renderer: lookRenderer, context: ctx)
         super.init()
+
+        if let saved = UserDefaults.standard.stringArray(forKey: Self.recentAssetsKey) {
+            state.recentAssetIDs = Array(saved.prefix(Self.recentAssetsCap))
+        }
 
         runtimeObserver = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
@@ -931,11 +958,12 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             } else {
                 output = PhotoProcessor.Output(data: primary, thumbnail: LibrarySaver.photoThumbnail(from: primary))
             }
-            LibrarySaver.savePhoto(data: output.data, rawDNG: dng, isDNG: primaryIsDNG) { [weak self] ok, saveError in
+            LibrarySaver.savePhoto(data: output.data, rawDNG: dng, isDNG: primaryIsDNG) { [weak self] ok, saveError, assetID in
                 guard let self = self else { return }
                 DispatchQueue.main.async {
                     self.state.isCapturingPhoto = false
                     if ok {
+                        if let assetID = assetID { self.recordAsset(assetID) }
                         if let thumb = output.thumbnail { self.state.lastThumbnail = thumb }
                     } else {
                         self.state.errorMessage = saveError?.localizedDescription
@@ -1042,10 +1070,11 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         }
         processingQueue.async { [weak self] in
             let thumb = LibrarySaver.videoThumbnail(url: url)
-            LibrarySaver.saveVideo(url: url) { ok, saveError in
+            LibrarySaver.saveVideo(url: url) { ok, saveError, assetID in
                 guard let self = self else { return }
                 DispatchQueue.main.async {
                     if ok {
+                        if let assetID = assetID { self.recordAsset(assetID) }
                         if let thumb = thumb { self.state.lastThumbnail = thumb }
                     } else {
                         self.state.errorMessage = saveError?.localizedDescription
