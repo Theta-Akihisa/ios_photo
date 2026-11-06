@@ -2,6 +2,7 @@
 //  Metal-backed live preview: latest camera frame -> look -> aspect-fill drawable.
 
 import CoreImage
+import ImageIO
 import MetalKit
 import SwiftUI
 import UIKit
@@ -9,15 +10,20 @@ import UIKit
 struct CameraPreviewView: UIViewRepresentable {
     let frames: PreviewFrameSource
     let look: LookPreset
+    let gear: GearSelection
+    let aperture: Float?
     let renderer: LookRendering
     let onTap: (_ devicePoint: CGPoint) -> Void
     let onTapViewPoint: ((CGPoint) -> Void)?
 
-    init(frames: PreviewFrameSource, look: LookPreset, renderer: LookRendering,
+    init(frames: PreviewFrameSource, look: LookPreset, gear: GearSelection = GearSelection(),
+         aperture: Float? = nil, renderer: LookRendering,
          onTap: @escaping (_ devicePoint: CGPoint) -> Void,
          onTapViewPoint: ((CGPoint) -> Void)? = nil) {
         self.frames = frames
         self.look = look
+        self.gear = gear
+        self.aperture = aperture
         self.renderer = renderer
         self.onTap = onTap
         self.onTapViewPoint = onTapViewPoint
@@ -29,7 +35,7 @@ struct CameraPreviewView: UIViewRepresentable {
     private static let flipVertically = false
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(frames: frames, look: look, renderer: renderer,
+        Coordinator(frames: frames, look: look, gear: gear, aperture: aperture, renderer: renderer,
                     onTap: onTap, onTapViewPoint: onTapViewPoint)
     }
 
@@ -55,6 +61,8 @@ struct CameraPreviewView: UIViewRepresentable {
         let c = context.coordinator
         c.frames = frames
         c.look = look
+        c.gear = gear
+        c.aperture = aperture
         c.renderer = renderer
         c.onTap = onTap
         c.onTapViewPoint = onTapViewPoint
@@ -65,6 +73,8 @@ struct CameraPreviewView: UIViewRepresentable {
     final class Coordinator: NSObject, MTKViewDelegate {
         var frames: PreviewFrameSource
         var look: LookPreset
+        var gear: GearSelection
+        var aperture: Float?
         var renderer: LookRendering
         var onTap: (CGPoint) -> Void
         var onTapViewPoint: ((CGPoint) -> Void)?
@@ -77,15 +87,23 @@ struct CameraPreviewView: UIViewRepresentable {
         // Change tracking so identical content is not re-rendered.
         private var lastBuffer: UnsafeMutableRawPointer?
         private var lastLook: LookPreset?
+        private var lastGear: GearSelection?
+        private var lastAperture: Float?
+        private var lastOrientation: CGImagePropertyOrientation?
+        /// Orientation used for the last drawn frame (tap mapping).
+        private var drawnOrientation: CGImagePropertyOrientation = .right
         private var lastIsLog = false
         private var lastDrawableSize: CGSize = .zero
         /// Size of the oriented (portrait) source image, used for tap mapping.
         private var orientedSize = CGSize(width: 3, height: 4)
 
-        init(frames: PreviewFrameSource, look: LookPreset, renderer: LookRendering,
+        init(frames: PreviewFrameSource, look: LookPreset, gear: GearSelection, aperture: Float?,
+             renderer: LookRendering,
              onTap: @escaping (CGPoint) -> Void, onTapViewPoint: ((CGPoint) -> Void)?) {
             self.frames = frames
             self.look = look
+            self.gear = gear
+            self.aperture = aperture
             self.renderer = renderer
             self.onTap = onTap
             self.onTapViewPoint = onTapViewPoint
@@ -115,7 +133,11 @@ struct CameraPreviewView: UIViewRepresentable {
 
             let ptr = Unmanaged.passUnretained(buffer).toOpaque()
             let currentLook = look
-            if ptr == lastBuffer, currentLook == lastLook, isLog == lastIsLog, size == lastDrawableSize {
+            let currentGear = gear
+            let currentAperture = aperture
+            let orientation = Self.currentOrientation(for: view)
+            if ptr == lastBuffer, currentLook == lastLook, isLog == lastIsLog, size == lastDrawableSize,
+               currentGear == lastGear, currentAperture == lastAperture, orientation == lastOrientation {
                 return // nothing changed
             }
 
@@ -125,12 +147,27 @@ struct CameraPreviewView: UIViewRepresentable {
             let base = isLog
                 ? CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
                 : CIImage(cvPixelBuffer: buffer)
-            let source = base.oriented(.right)
-            let looked = renderer.apply(currentLook, to: source, isLogSource: isLog)
+            let oriented = base.oriented(orientation)
+            let ow = oriented.extent.width, oh = oriented.extent.height
+            guard ow > 0, oh > 0 else { return }
+            orientedSize = oriented.extent.size
+            drawnOrientation = orientation
+
+            // Downscale to roughly the drawable size BEFORE the look/gear (much cheaper bloom/grain/cube).
+            let fill = max(size.width / ow, size.height / oh)
+            var source = oriented
+            if fill < 0.9 {
+                let s = fill * 1.1
+                source = oriented
+                    .transformed(by: CGAffineTransform(translationX: -oriented.extent.origin.x,
+                                                       y: -oriented.extent.origin.y))
+                    .transformed(by: CGAffineTransform(scaleX: s, y: s))
+            }
+            let looked = renderer.apply(currentLook, gear: currentGear, aperture: currentAperture,
+                                        cheap: false, to: source, isLogSource: isLog)
 
             let extent = source.extent // the look must not change geometry; use source extent
             guard extent.width > 0, extent.height > 0 else { return }
-            orientedSize = extent.size
 
             // Aspect-fill: move origin to 0, scale to cover, center (optionally flipping Y, see flipVertically).
             let scale = max(size.width / extent.width, size.height / extent.height)
@@ -159,8 +196,22 @@ struct CameraPreviewView: UIViewRepresentable {
 
             lastBuffer = ptr
             lastLook = currentLook
+            lastGear = currentGear
+            lastAperture = currentAperture
+            lastOrientation = orientation
             lastIsLog = isLog
             lastDrawableSize = size
+        }
+
+        // MARK: Orientation
+
+        /// Sensor frames are landscape-right. Read on the main thread (display link).
+        private static func currentOrientation(for view: UIView) -> CGImagePropertyOrientation {
+            switch view.window?.windowScene?.interfaceOrientation {
+            case .landscapeRight: return .up
+            case .landscapeLeft: return .down
+            default: return .right
+            }
         }
 
         // MARK: Tap handling
@@ -181,8 +232,13 @@ struct CameraPreviewView: UIViewRepresentable {
             var yNorm = min(max((p.y - offY) / dispH, 0), 1)
             if CameraPreviewView.flipVertically { yNorm = 1 - yNorm } // image is drawn flipped
 
-            // Oriented-right portrait -> landscape-right sensor point of interest.
-            let device = CGPoint(x: yNorm, y: 1 - xNorm)
+            // Oriented image -> landscape-right sensor point of interest.
+            let device: CGPoint
+            switch drawnOrientation {
+            case .up: device = CGPoint(x: xNorm, y: yNorm)
+            case .down: device = CGPoint(x: 1 - xNorm, y: 1 - yNorm)
+            default: device = CGPoint(x: yNorm, y: 1 - xNorm)   // .right (portrait)
+            }
             onTapViewPoint?(p)
             onTap(device)
         }
