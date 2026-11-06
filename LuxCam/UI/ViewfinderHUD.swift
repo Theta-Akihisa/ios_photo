@@ -3,12 +3,67 @@
 
 import SwiftUI
 
+/// "M9 · SUMMILUX 35"
+private func gearLabel(_ state: CameraState) -> String {
+    "\(state.gear.body.shortTitle) · \(state.gear.lens.shortTitle)"
+}
+
+private func lookLabel(_ state: CameraState) -> String {
+    "\(state.look.family.title) · \(state.look.title)"
+}
+
+private struct RAWBadge: View {
+    var body: some View {
+        Text("RAW")
+            .font(Theme.mono(10, .semibold))
+            .foregroundStyle(Theme.red)
+            .padding(.horizontal, 5).padding(.vertical, 2)
+            .overlay(Rectangle().stroke(Theme.red, lineWidth: 0.5))
+    }
+}
+
+private struct RecordingTimer: View {
+    let seconds: Double
+    var body: some View {
+        HStack(spacing: 5) {
+            // Blinking record dot.
+            TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+                let on = Int(ctx.date.timeIntervalSinceReferenceDate * 2) % 2 == 0
+                Circle().fill(Theme.red).frame(width: 7, height: 7).opacity(on ? 1 : 0.15)
+            }
+            Text(Fmt.mmss(seconds))
+                .font(Theme.mono(13, .medium))
+                .foregroundStyle(Theme.red)
+                .monospacedDigit()
+        }
+    }
+}
+
+/// REC timer + format badge (video) or RAW badge (photo with ProRAW).
+private struct FormatInfo: View {
+    let state: CameraState
+    var alignment: HorizontalAlignment = .trailing
+
+    var body: some View {
+        if state.mode.isVideo {
+            VStack(alignment: alignment, spacing: 2) {
+                if state.isRecording { RecordingTimer(seconds: state.recordingSeconds) }
+                Text(state.video.badgeText)
+                    .font(Theme.mono(9))
+                    .foregroundStyle(Theme.dim)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+            }
+        } else if state.mode == .photo && state.photoFormat == .proRAW {
+            RAWBadge()
+        }
+    }
+}
+
+/// Portrait top bar: logo, gear + look label (tap the gear label for the picker), REC / format.
 struct TopBarView: View {
     let state: CameraState
-
-    private var lookLabel: String {
-        "\(state.look.family.title) · \(state.look.title)"
-    }
+    var onGearTap: () -> Void = {}
 
     var body: some View {
         ZStack {
@@ -17,49 +72,64 @@ struct TopBarView: View {
                 Text("LuxCam").luxCaps(11, weight: .semibold)
                 Spacer()
             }
-            Text(lookLabel)
-                .luxCaps(10, color: Theme.dim)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
-                .padding(.horizontal, 90)
+            VStack(spacing: 2) {
+                Button(action: onGearTap) {
+                    Text(gearLabel(state))
+                        .luxCaps(10, weight: .semibold, color: Theme.text)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("ギア選択")
+                Text(lookLabel(state))
+                    .luxCaps(9, color: Theme.dim)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+            }
+            .padding(.horizontal, 100)
             HStack {
                 Spacer()
-                if state.mode.isVideo { videoInfo }
-                else if state.mode == .photo && state.photoFormat == .proRAW {
-                    Text("RAW")
-                        .font(Theme.mono(10, .semibold))
-                        .foregroundStyle(Theme.red)
-                        .padding(.horizontal, 5).padding(.vertical, 2)
-                        .overlay(Rectangle().stroke(Theme.red, lineWidth: 0.5))
-                }
+                FormatInfo(state: state)
+                    .frame(maxWidth: 140, alignment: .trailing)
             }
         }
         .padding(.horizontal, Theme.gutter)
         .frame(height: 44)
     }
+}
 
-    private var videoInfo: some View {
-        VStack(alignment: .trailing, spacing: 2) {
-            if state.isRecording {
-                HStack(spacing: 5) {
-                    // Blinking record dot.
-                    TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
-                        let on = Int(ctx.date.timeIntervalSinceReferenceDate * 2) % 2 == 0
-                        Circle().fill(Theme.red).frame(width: 7, height: 7).opacity(on ? 1 : 0.15)
-                    }
-                    Text(Fmt.mmss(state.recordingSeconds))
-                        .font(Theme.mono(13, .medium))
-                        .foregroundStyle(Theme.red)
-                        .monospacedDigit()
+/// Landscape control-column header: logo, gear, look, REC / format.
+struct LandscapeInfoView: View {
+    let state: CameraState
+    var onGearTap: () -> Void = {}
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    RedDot(size: 7)
+                    Text("LuxCam").luxCaps(10, weight: .semibold)
                 }
+                Button(action: onGearTap) {
+                    Text(gearLabel(state))
+                        .luxCaps(9, weight: .semibold, color: Theme.text)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("ギア選択")
+                Text(lookLabel(state))
+                    .luxCaps(8, color: Theme.dim)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
             }
-            Text(state.video.badgeText)
-                .font(Theme.mono(9))
-                .foregroundStyle(Theme.dim)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
+            Spacer(minLength: 0)
+            FormatInfo(state: state)
+                .frame(maxWidth: 110, alignment: .trailing)
         }
-        .frame(maxWidth: 140, alignment: .trailing)
+        .padding(.horizontal, 12)
     }
 }
 
@@ -77,6 +147,9 @@ struct ViewfinderHUD: View {
             Text(Fmt.shutter(state.liveShutterSeconds)).foregroundStyle(manualExposure ? Theme.red : Theme.text)
             if showsAperture {
                 Text(Fmt.aperture(state.simulatedAperture)).foregroundStyle(Theme.text)
+            }
+            if state.liveZoomFactor > 1.01 {
+                Text(String(format: "%.1f×", Double(state.liveZoomFactor))).foregroundStyle(Theme.text)
             }
             Text("\(manualFocus ? "MF" : "AF") \(Fmt.lens(state.liveLensPosition))")
                 .foregroundStyle(manualFocus ? Theme.red : Theme.text)

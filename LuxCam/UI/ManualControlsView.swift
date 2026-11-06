@@ -4,7 +4,7 @@
 import SwiftUI
 
 enum ManualChip: String, Identifiable {
-    case focus, shutter, iso, ev, look, aperture, format, photoFormat
+    case gear, focus, shutter, iso, ev, look, aperture, format, photoFormat
     var id: String { rawValue }
 }
 
@@ -12,6 +12,9 @@ struct ManualControlsView: View {
     @ObservedObject var camera: CameraService
     @State private var selected: ManualChip?
     @State private var showFormat = false
+    @State private var showGear = false
+    /// Landscape control column: chips wrap into a grid and the dial uses the column width.
+    var compact: Bool = false
 
     private var state: CameraState { camera.state }
     private var isExposureAuto: Bool { state.manual.exposure == .auto }
@@ -21,7 +24,7 @@ struct ManualControlsView: View {
     private static let shutterTable: [Double] = [8000, 4000, 2000, 1000, 500, 250, 125, 60, 30, 15, 8, 4, 2].map { 1.0 / $0 }
     private static let isoTable: [Float] = [25, 32, 40, 50, 64, 80, 100, 125, 160, 200, 250, 320, 400, 500,
                                             640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400]
-    private static let apertureTable: [Float] = [1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.8, 3.2, 3.5, 4.0, 4.5, 5.6,
+    private static let apertureTable: [Float] = [1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.8, 3.2, 3.5, 4.0, 4.5, 5.6,
                                                  6.3, 7.1, 8.0, 9.0, 11.0, 13.0, 16.0]
 
     private var shutterStops: [Double] {
@@ -50,7 +53,7 @@ struct ManualControlsView: View {
     // MARK: Available chips
 
     private var chips: [ManualChip] {
-        var list: [ManualChip] = [.focus, .shutter, .iso]
+        var list: [ManualChip] = [.gear, .focus, .shutter, .iso]
         if isExposureAuto { list.append(.ev) }
         list.append(.look)
         if state.mode == .portrait || state.mode == .cinematic { list.append(.aperture) }
@@ -65,40 +68,60 @@ struct ManualControlsView: View {
             chipRow
             if let selected, chips.contains(selected) {
                 detail(for: selected)
-                    .padding(.horizontal, Theme.gutter)
+                    .padding(.horizontal, compact ? 8 : Theme.gutter)
                     .transition(.opacity)
                     .id(selected)
             }
         }
         .animation(.easeInOut(duration: 0.2), value: selected)
         .sheet(isPresented: $showFormat) { VideoFormatView(camera: camera) }
+        .sheet(isPresented: $showGear) { GearPickerView(camera: camera) }
+        .onChange(of: state.gear) { _, _ in
+            // The new lens may be slower than the current simulated aperture allows.
+            let lower = apertureLowerBound
+            if state.simulatedAperture < lower - 0.01 { camera.set(simulatedAperture: lower) }
+        }
     }
 
     // MARK: Chips
 
+    @ViewBuilder
     private var chipRow: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(chips) { chip in
-                    Button {
-                        if chip == .format {
-                            showFormat = true
-                        } else {
-                            selected = (selected == chip) ? nil : chip
-                        }
-                    } label: {
-                        chipLabel(chip)
-                    }
-                    .buttonStyle(.plain)
-                }
+        if compact {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3), spacing: 6) {
+                ForEach(chips) { chip in chipButton(chip) }
             }
-            .padding(.horizontal, Theme.gutter)
+            .padding(.horizontal, 8)
+            .sensoryFeedback(.selection, trigger: selected)
+        } else {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(chips) { chip in chipButton(chip) }
+                }
+                .padding(.horizontal, Theme.gutter)
+            }
+            .sensoryFeedback(.selection, trigger: selected)
         }
-        .sensoryFeedback(.selection, trigger: selected)
+    }
+
+    private func chipButton(_ chip: ManualChip) -> some View {
+        Button {
+            if chip == .format {
+                showFormat = true
+            } else if chip == .gear {
+                showGear = true
+            } else {
+                selected = (selected == chip) ? nil : chip
+            }
+        } label: {
+            chipLabel(chip)
+        }
+        .buttonStyle(.plain)
     }
 
     private func chipTitle(_ chip: ManualChip) -> String {
         switch chip {
+        case .gear: return "GEAR"
         case .focus: return state.manual.focus == .auto ? "AF" : "MF"
         case .shutter: return "S"
         case .iso: return "ISO"
@@ -112,6 +135,7 @@ struct ManualControlsView: View {
 
     private func chipValue(_ chip: ManualChip) -> String {
         switch chip {
+        case .gear: return state.gear.body.shortTitle
         case .focus:
             if case .manual(let p) = state.manual.focus { return Fmt.lens(p) }
             return "AUTO"
@@ -137,9 +161,10 @@ struct ManualControlsView: View {
                 .font(Theme.mono(12, .medium))
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
+                .minimumScaleFactor(0.6)
         }
-        .frame(minWidth: 54)
-        .padding(.horizontal, 10).padding(.vertical, 7)
+        .frame(minWidth: compact ? 0 : 54, maxWidth: compact ? .infinity : nil)
+        .padding(.horizontal, compact ? 6 : 10).padding(.vertical, 7)
         .overlay(Rectangle().stroke(isSelected ? Theme.red : Theme.hairline, lineWidth: 0.5))
         .contentShape(Rectangle())
     }
@@ -149,6 +174,7 @@ struct ManualControlsView: View {
     @ViewBuilder
     private func detail(for chip: ManualChip) -> some View {
         switch chip {
+        case .gear: EmptyView()
         case .focus: focusDial
         case .shutter: shutterDial
         case .iso: isoDial
@@ -184,7 +210,7 @@ struct ManualControlsView: View {
                 }
             }
             if state.photoFormat == .proRAW {
-                Text("ProRAW: DNG を同時保存（ルックはHEIFのみに適用）")
+                Text("ProRAW: DNG を同時保存（ルックはHEIFのみに適用）（DNG は 4:3 のまま保存）")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.dim)
             }
@@ -293,8 +319,18 @@ struct ManualControlsView: View {
             label: { v in Fmt.ev(v) + " EV" })
     }
 
+    /// Dial minimum: the lens' widest aperture, but never below f/1.0 (depth blur cannot go lower).
+    private var apertureLowerBound: Float { max(state.gear.lens.maxAperture, 1.0) }
+
+    private var apertureStops: [Float] {
+        let lower = apertureLowerBound
+        var list = Self.apertureTable.filter { $0 >= lower * 0.999 }
+        if list.isEmpty || list[0] > lower * 1.03 { list.insert(lower, at: 0) }
+        return list
+    }
+
     private var apertureDial: some View {
-        let stops = Self.apertureTable
+        let stops = apertureStops
         let asDouble = stops.map { Double($0) }
         return ScaleDial(
             value: Binding(

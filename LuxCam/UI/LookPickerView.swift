@@ -42,12 +42,13 @@ struct LookPickerView: View {
 
     private func card(_ preset: LookPreset) -> some View {
         let selected = camera.state.look == preset
+        let allowed = camera.state.gear.body.allows(preset)
         return Button {
             camera.set(look: preset)
         } label: {
             VStack(alignment: .leading, spacing: 5) {
                 Text(preset.title).luxCaps(11, weight: .semibold, color: selected ? Theme.text : Theme.dim)
-                Text(preset.shortDescription)
+                Text(allowed ? preset.shortDescription : "MONOCHROM 専用")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.dim)
                     .lineLimit(2)
@@ -63,6 +64,8 @@ struct LookPickerView: View {
             .overlay(Rectangle().stroke(Theme.hairline, lineWidth: 0.5))
         }
         .buttonStyle(.plain)
+        .disabled(!allowed)
+        .opacity(allowed ? 1 : 0.35)
         .sensoryFeedback(.selection, trigger: selected)
     }
 }

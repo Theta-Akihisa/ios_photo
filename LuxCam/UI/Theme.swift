@@ -73,7 +73,9 @@ enum Fmt {
     }
 
     static func aperture(_ f: Float) -> String {
-        let text = f == f.rounded() ? String(format: "%.0f", f) : String(format: "%.1f", f)
+        let text: String
+        if f < 1 { text = String(format: "%.2f", f) }
+        else { text = f == f.rounded() ? String(format: "%.0f", f) : String(format: "%.1f", f) }
         return "ƒ/\(text)"
     }
 }
