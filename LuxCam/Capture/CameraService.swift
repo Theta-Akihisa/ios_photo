@@ -146,6 +146,11 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     /// Main thread only. Drops the given IDs from the history (e.g. after deletion).
     func forgetAssets(_ ids: [String]) {
         let drop = Set(ids)
+        // The camera screen thumbnail shows the newest capture; clear it if that one is gone
+        // so the UI reloads the thumbnail of the next asset.
+        if let first = state.recentAssetIDs.first, drop.contains(first) {
+            state.lastThumbnail = nil
+        }
         let ids = state.recentAssetIDs.filter { !drop.contains($0) }
         state.recentAssetIDs = ids
         UserDefaults.standard.set(ids, forKey: Self.recentAssetsKey)
