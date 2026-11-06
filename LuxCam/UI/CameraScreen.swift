@@ -342,5 +342,11 @@ struct CameraScreen: View {
 
 private struct SlotFramePreference: PreferenceKey {
     static var defaultValue: CGRect = .zero
-    static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
+    /// Sibling views that don't set this preference contribute `defaultValue` (.zero) here.
+    /// Ignore those, otherwise the measured slot is overwritten and the layout falls back to
+    /// the full screen (preview hidden under the controls, HUD at the very bottom).
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        let next = nextValue()
+        if next != .zero { value = next }
+    }
 }
