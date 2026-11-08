@@ -4,6 +4,7 @@
 
 import AVFoundation
 import CoreImage
+import ImageIO
 import Photos
 import UIKit
 
@@ -40,8 +41,18 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
     private let completion: (Data?, Data?, Error?) -> Void
     /// Called when the sensor is about to capture (shutter moment).
     var onWillCapture: (() -> Void)?
-    /// Called when the sensor has finished capturing; the next shot may start.
+    /// Called exactly once per capture when the sensor is free again (didCapturePhoto, or at the
+    /// latest didFinishCapture if the former never arrives); the next shot may start.
     var onDidCapture: (() -> Void)?
+    /// Small embedded preview of the processed photo, for an immediate thumbnail.
+    var onPreview: ((CGImage, CGImagePropertyOrientation) -> Void)?
+    private var released = false
+
+    private func releaseOnce() {
+        guard !released else { return }
+        released = true
+        onDidCapture?()
+    }
 
     init(completion: @escaping (Data?, Data?, Error?) -> Void) {
         self.completion = completion
@@ -53,7 +64,7 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
-        onDidCapture?()
+        releaseOnce()
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
@@ -64,6 +75,10 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
         if photo.isRawPhoto {
             rawData = photo.fileDataRepresentation()
         } else {
+            if let onPreview = onPreview, let preview = photo.previewCGImageRepresentation() {
+                let raw = (photo.metadata[kCGImagePropertyOrientation as String] as? NSNumber)?.uint32Value ?? 1
+                onPreview(preview, CGImagePropertyOrientation(rawValue: raw) ?? .up)
+            }
             data = photo.fileDataRepresentation()
         }
     }
@@ -71,6 +86,7 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings,
                      error: Error?) {
+        releaseOnce()
         completion(data, rawData, captureError ?? error)
     }
 }
@@ -78,9 +94,6 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
 // MARK: - CameraService
 
 final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
-
-    /// Captured-but-unsaved photos allowed before the shutter waits (bounds memory for 48 MP / ProRAW).
-    private static let maxPendingPhotos = 3
 
     // MARK: Public API state
     @Published private(set) var state = CameraState()
@@ -306,6 +319,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                 session.beginConfiguration()
                 applyProRAWState(mode: q.mode)
                 updatePhotoDimensions(mode: q.mode, device: dev)
+                configureResponsiveCapture()
                 session.commitConfiguration()
                 publishCapabilities(device: dev, cinematicActive: false)
             }
@@ -400,8 +414,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
 
     func capturePhoto() {
         let mode = state.mode
-        guard !state.isCapturingPhoto, state.pendingPhotos < Self.maxPendingPhotos,
-              mode == .photo || mode == .portrait else { return }
+        guard state.canCapturePhoto, mode == .photo || mode == .portrait else { return }
         state.isCapturingPhoto = true
         state.pendingPhotos += 1
         let look = state.look
@@ -437,6 +450,9 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             delegate.onDidCapture = { [weak self] in
                 // The sensor is free again: allow the next shot while this one is processed and saved.
                 self?.updateState { $0.isCapturingPhoto = false }
+            }
+            delegate.onPreview = { [weak self] cg, orientation in
+                self?.publishQuickThumbnail(cg, orientation: orientation, look: look, gear: gear)
             }
             inflightPhotos[id] = delegate
             photoOutput.capturePhoto(with: settings, delegate: delegate)
@@ -653,7 +669,6 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
 
     private func configurePhotoOutput(mode: CameraMode, device dev: AVCaptureDevice) {
         photoOutput.maxPhotoQualityPrioritization = .quality
-        configureResponsiveCapture()
         let portrait = (mode == .portrait)
         if photoOutput.isDepthDataDeliverySupported {
             photoOutput.isDepthDataDeliveryEnabled = portrait
@@ -664,12 +679,15 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         // ProRAW is evaluated here, after the photo preset / format has been applied.
         applyProRAWState(mode: mode)
         updatePhotoDimensions(mode: mode, device: dev)
+        // Last: support for responsive capture depends on depth / ProRAW / dimensions.
+        configureResponsiveCapture()
         // Wide colour stays automatic in photo mode (session.automaticallyConfiguresCaptureDeviceForWideColor).
     }
 
-    /// iOS 17 low-latency capture: zero shutter lag (uses frames from the moment of the press),
-    /// responsive capture (overlapping captures) and fast capture prioritization for bursts.
-    /// Each flag is only valid / set when supported, and only written when it changes.
+    /// iOS 17 low-latency capture: zero shutter lag (uses frames from the moment of the press; on by
+    /// default for iOS 17+ apps) and responsive capture (overlapping captures).
+    /// Fast capture prioritization is deliberately left off: it lowers quality on rapid presses.
+    /// Each flag is only set when supported, and only written when it changes.
     private func configureResponsiveCapture() {
         if photoOutput.isZeroShutterLagSupported, !photoOutput.isZeroShutterLagEnabled {
             photoOutput.isZeroShutterLagEnabled = true
@@ -679,9 +697,8 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
            !photoOutput.isResponsiveCaptureEnabled {
             photoOutput.isResponsiveCaptureEnabled = true
         }
-        if photoOutput.isResponsiveCaptureEnabled, photoOutput.isFastCapturePrioritizationSupported,
-           !photoOutput.isFastCapturePrioritizationEnabled {
-            photoOutput.isFastCapturePrioritizationEnabled = true
+        if photoOutput.isFastCapturePrioritizationEnabled {
+            photoOutput.isFastCapturePrioritizationEnabled = false
         }
     }
 
@@ -974,6 +991,14 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             settings = AVCapturePhotoSettings()
         }
         settings.photoQualityPrioritization = .balanced
+        // Small embedded preview for an immediate thumbnail (see PhotoCaptureDelegate.onPreview).
+        if let previewType = settings.availablePreviewPhotoPixelFormatTypes.first {
+            settings.previewPhotoFormat = [
+                kCVPixelBufferPixelFormatTypeKey as String: previewType,
+                kCVPixelBufferWidthKey as String: 320,
+                kCVPixelBufferHeightKey as String: 320
+            ]
+        }
         let maxDims = photoOutput.maxPhotoDimensions
         if maxDims.width > 0, maxDims.height > 0 {
             settings.maxPhotoDimensions = maxDims
@@ -991,6 +1016,21 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         return settings
     }
 
+    /// Immediate thumbnail from the photo's small embedded preview (look applied, cheap path).
+    /// The saved photo's thumbnail replaces it once processing and saving are done.
+    private func publishQuickThumbnail(_ cg: CGImage, orientation: CGImagePropertyOrientation,
+                                       look: LookPreset, gear: GearSelection) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            var image = CIImage(cgImage: cg).oriented(orientation)
+            image = self.lookRenderer.apply(look, gear: gear, aperture: nil, cheap: true,
+                                            to: image, isLogSource: false)
+            guard let out = self.ciContext.createCGImage(image, from: image.extent) else { return }
+            let thumb = UIImage(cgImage: out)
+            DispatchQueue.main.async { self.state.lastThumbnail = thumb }
+        }
+    }
+
     private func photoCaptureFinished(id: Int64, data: Data?, rawData: Data?, error: Error?,
                                       mode: CameraMode, look: LookPreset, gear: GearSelection, aperture: Float) {
         sessionQueue.async { [self] in inflightPhotos[id] = nil }
@@ -1003,8 +1043,6 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             updateState { $0.pendingPhotos = max(0, $0.pendingPhotos - 1) }
             return
         }
-        // Normally released at didCapturePhoto already; this covers paths where it isn't called.
-        updateState { $0.isCapturingPhoto = false }
         let dng = (data != nil) ? rawData : nil
         processingQueue.async { [self] in
             let output: PhotoProcessor.Output

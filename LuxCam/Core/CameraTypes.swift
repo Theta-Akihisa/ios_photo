@@ -193,8 +193,12 @@ struct CameraState: Equatable {
     var isCapturingPhoto = false
     /// Incremented at the exact moment the sensor captures (willCapturePhoto) — drives the shutter flash.
     var shutterCount = 0
-    /// Photos captured but not yet processed/saved (the shutter is blocked at 3 to bound memory).
+    /// Photos captured but not yet processed/saved (the shutter waits at `maxPendingPhotos`).
     var pendingPhotos = 0
+    /// Captured-but-unsaved photos allowed before the shutter waits (bounds memory for 48 MP / ProRAW).
+    static let maxPendingPhotos = 3
+    /// The shutter accepts a new photo.
+    var canCapturePhoto: Bool { !isCapturingPhoto && pendingPhotos < Self.maxPendingPhotos }
 
     /// Live readouts from the device (KVO), for HUD display.
     var liveISO: Float = 0

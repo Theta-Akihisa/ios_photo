@@ -257,7 +257,7 @@ struct CameraScreen: View {
     // MARK: Shared pieces
 
     private var shutter: some View {
-        ShutterButton(mode: state.mode, isRecording: state.isRecording, isBusy: state.isCapturingPhoto || state.pendingPhotos >= 3) {
+        ShutterButton(mode: state.mode, isRecording: state.isRecording, isBusy: !state.mode.isVideo && !state.canCapturePhoto) {
             if state.mode.isVideo { camera.toggleRecording() } else { camera.capturePhoto() }
         }
     }
