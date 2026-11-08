@@ -188,7 +188,13 @@ struct CameraState: Equatable {
     var isSessionRunning = false
     var isRecording = false
     var recordingSeconds: Double = 0
+    /// True from the shutter press until the sensor has captured the frame (didCapturePhoto).
+    /// Processing / saving continues in the background and does not block the next shot.
     var isCapturingPhoto = false
+    /// Incremented at the exact moment the sensor captures (willCapturePhoto) — drives the shutter flash.
+    var shutterCount = 0
+    /// Photos captured but not yet processed/saved (the shutter is blocked at 3 to bound memory).
+    var pendingPhotos = 0
 
     /// Live readouts from the device (KVO), for HUD display.
     var liveISO: Float = 0

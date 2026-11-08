@@ -56,13 +56,14 @@ struct CameraScreen: View {
             if isNil { loadFallbackThumbnail() }
         }
         .onChange(of: state.recentAssetIDs) { _, _ in loadFallbackThumbnail() }
-        .onChange(of: state.isCapturingPhoto) { _, capturing in
-            guard capturing else { return }
+        // Flash + haptic at the real shutter moment (willCapturePhoto), not at the button press.
+        .onChange(of: state.shutterCount) { _, _ in
             flash = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                withAnimation(.easeOut(duration: 0.2)) { flash = false }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                withAnimation(.easeOut(duration: 0.15)) { flash = false }
             }
         }
+        .sensoryFeedback(.impact(weight: .light), trigger: state.shutterCount)
     }
 
     /// Opaque black in photo modes, translucent over the full-bleed video preview.
@@ -256,7 +257,7 @@ struct CameraScreen: View {
     // MARK: Shared pieces
 
     private var shutter: some View {
-        ShutterButton(mode: state.mode, isRecording: state.isRecording, isBusy: state.isCapturingPhoto) {
+        ShutterButton(mode: state.mode, isRecording: state.isRecording, isBusy: state.isCapturingPhoto || state.pendingPhotos >= 3) {
             if state.mode.isVideo { camera.toggleRecording() } else { camera.capturePhoto() }
         }
     }

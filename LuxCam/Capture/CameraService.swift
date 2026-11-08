@@ -38,10 +38,22 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
     private var rawData: Data?
     private var captureError: Error?
     private let completion: (Data?, Data?, Error?) -> Void
+    /// Called when the sensor is about to capture (shutter moment).
+    var onWillCapture: (() -> Void)?
+    /// Called when the sensor has finished capturing; the next shot may start.
+    var onDidCapture: (() -> Void)?
 
     init(completion: @escaping (Data?, Data?, Error?) -> Void) {
         self.completion = completion
         super.init()
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        onWillCapture?()
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        onDidCapture?()
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
@@ -66,6 +78,9 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
 // MARK: - CameraService
 
 final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
+
+    /// Captured-but-unsaved photos allowed before the shutter waits (bounds memory for 48 MP / ProRAW).
+    private static let maxPendingPhotos = 3
 
     // MARK: Public API state
     @Published private(set) var state = CameraState()
@@ -385,8 +400,10 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
 
     func capturePhoto() {
         let mode = state.mode
-        guard !state.isCapturingPhoto, mode == .photo || mode == .portrait else { return }
+        guard !state.isCapturingPhoto, state.pendingPhotos < Self.maxPendingPhotos,
+              mode == .photo || mode == .portrait else { return }
         state.isCapturingPhoto = true
+        state.pendingPhotos += 1
         let look = state.look
         let gear = state.gear
         let aperture = state.simulatedAperture
@@ -394,11 +411,15 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         sessionQueue.async { [self] in
             guard session.isRunning, session.outputs.contains(photoOutput) else {
                 publishError("Camera is not ready.")
+                updateState { $0.pendingPhotos = max(0, $0.pendingPhotos - 1) }
                 return
             }
             if let conn = photoOutput.connection(with: .video) {
                 let angle = currentCaptureAngle()
-                if conn.isVideoRotationAngleSupported(angle) { conn.videoRotationAngle = angle }
+                // Only touch the connection when the angle really changed (avoids extra work per shot).
+                if conn.videoRotationAngle != angle, conn.isVideoRotationAngleSupported(angle) {
+                    conn.videoRotationAngle = angle
+                }
             }
             if mode == .photo, q.photoFormat == .proRAW, !photoOutput.isAppleProRAWEnabled {
                 updateState { $0.errorMessage = "ProRAW を有効にできませんでした。HEIF で保存します。" }
@@ -408,6 +429,14 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             let delegate = PhotoCaptureDelegate { [weak self] data, rawData, error in
                 self?.photoCaptureFinished(id: id, data: data, rawData: rawData, error: error,
                                            mode: mode, look: look, gear: gear, aperture: aperture)
+            }
+            delegate.onWillCapture = { [weak self] in
+                // Shutter moment: flash / haptic in the UI.
+                self?.updateState { $0.shutterCount &+= 1 }
+            }
+            delegate.onDidCapture = { [weak self] in
+                // The sensor is free again: allow the next shot while this one is processed and saved.
+                self?.updateState { $0.isCapturingPhoto = false }
             }
             inflightPhotos[id] = delegate
             photoOutput.capturePhoto(with: settings, delegate: delegate)
@@ -624,6 +653,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
 
     private func configurePhotoOutput(mode: CameraMode, device dev: AVCaptureDevice) {
         photoOutput.maxPhotoQualityPrioritization = .quality
+        configureResponsiveCapture()
         let portrait = (mode == .portrait)
         if photoOutput.isDepthDataDeliverySupported {
             photoOutput.isDepthDataDeliveryEnabled = portrait
@@ -635,6 +665,24 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         applyProRAWState(mode: mode)
         updatePhotoDimensions(mode: mode, device: dev)
         // Wide colour stays automatic in photo mode (session.automaticallyConfiguresCaptureDeviceForWideColor).
+    }
+
+    /// iOS 17 low-latency capture: zero shutter lag (uses frames from the moment of the press),
+    /// responsive capture (overlapping captures) and fast capture prioritization for bursts.
+    /// Each flag is only valid / set when supported, and only written when it changes.
+    private func configureResponsiveCapture() {
+        if photoOutput.isZeroShutterLagSupported, !photoOutput.isZeroShutterLagEnabled {
+            photoOutput.isZeroShutterLagEnabled = true
+        }
+        // Responsive capture requires zero shutter lag.
+        if photoOutput.isZeroShutterLagEnabled, photoOutput.isResponsiveCaptureSupported,
+           !photoOutput.isResponsiveCaptureEnabled {
+            photoOutput.isResponsiveCaptureEnabled = true
+        }
+        if photoOutput.isResponsiveCaptureEnabled, photoOutput.isFastCapturePrioritizationSupported,
+           !photoOutput.isFastCapturePrioritizationEnabled {
+            photoOutput.isFastCapturePrioritizationEnabled = true
+        }
     }
 
     /// Enables / disables Apple ProRAW according to the current mode and user choice.
@@ -659,9 +707,12 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         let noRerender = q.look == .native && abs(q.gear.body.photoAspect - 4.0 / 3.0) < 0.001
             && CaptureFormats.isNeutral(q.gear)
         let wantFull = !portrait && (noRerender || q.photoFormat == .proRAW)
+        // 48 MP capture is noticeably slower (and can bypass zero shutter lag), so like the stock
+        // Camera app HEIF uses up to ~24 MP; the full 48 MP is reserved for ProRAW.
+        let allow48 = q.photoFormat == .proRAW
         let pick: CMVideoDimensions?
-        if wantFull && currentZoom > 1.05 {
-            // Zoomed: 48 MP would only be an upscaled crop, so stay at <= ~24 MP (5712x4284 = 24.5 MP).
+        if wantFull && (currentZoom > 1.05 || !allow48) {
+            // Zoomed (48 MP would only be an upscaled crop) or HEIF: stay at <= ~24 MP (5712x4284 = 24.5 MP).
             pick = dims.filter { area($0) <= 25_000_000 }.max(by: { area($0) < area($1) })
                 ?? dims.min(by: { area($0) < area($1) })
         } else if wantFull {
@@ -949,8 +1000,11 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         let primaryIsDNG = (data == nil)
         guard let primary = primary else {
             publishError(error?.localizedDescription ?? "Photo capture failed.")
+            updateState { $0.pendingPhotos = max(0, $0.pendingPhotos - 1) }
             return
         }
+        // Normally released at didCapturePhoto already; this covers paths where it isn't called.
+        updateState { $0.isCapturingPhoto = false }
         let dng = (data != nil) ? rawData : nil
         processingQueue.async { [self] in
             let output: PhotoProcessor.Output
@@ -966,7 +1020,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             LibrarySaver.savePhoto(data: output.data, rawDNG: dng, isDNG: primaryIsDNG) { [weak self] ok, saveError, assetID in
                 guard let self = self else { return }
                 DispatchQueue.main.async {
-                    self.state.isCapturingPhoto = false
+                    self.state.pendingPhotos = max(0, self.state.pendingPhotos - 1)
                     if ok {
                         if let assetID = assetID { self.recordAsset(assetID) }
                         if let thumb = output.thumbnail { self.state.lastThumbnail = thumb }
