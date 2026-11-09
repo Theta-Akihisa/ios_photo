@@ -1,13 +1,13 @@
 //  CameraScreen.swift
-//  Main screen. Portrait: top bar, viewfinder, controls. Landscape (verticalSizeClass == .compact):
-//  viewfinder on the leading side, control column on the trailing side.
+//  Main screen. Portrait: top bar, viewfinder, controls. Landscape (physical, via CoreMotion):
+//  overlay laid out in a rotated canvas; viewfinder on the leading side, control column on the trailing side.
 
 import SwiftUI
 import UIKit
 
 struct CameraScreen: View {
     @ObservedObject var camera: CameraService
-    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @StateObject private var orientationObserver = DeviceOrientationObserver()
 
     @State private var showGrid = false
     @State private var showGear = false
@@ -23,19 +23,25 @@ struct CameraScreen: View {
     @State private var slotFrame: CGRect = .zero
 
     private var state: CameraState { camera.state }
-    private var isLandscape: Bool { verticalSizeClass == .compact }
+    private var orientation: PhysicalOrientation { orientationObserver.orientation }
+    private var isLandscape: Bool { orientation != .portrait }
+    /// Canvas rotation (SwiftUI, positive = clockwise): right side down (user's up = screen -x) -> -90,
+    /// left side down -> +90.
+    private var canvasDegrees: Double { orientation == .landscapeLeftSideDown ? 90 : -90 }
     /// Width of the landscape control column (excluding the trailing safe area).
     private let columnWidth: CGFloat = 270
 
     var body: some View {
         GeometryReader { outer in
             let insets = outer.safeAreaInsets
+            let screen = CGSize(width: outer.size.width + insets.leading + insets.trailing,
+                                height: outer.size.height + insets.top + insets.bottom)
             ZStack {
                 Theme.black.ignoresSafeArea()
                 // One preview instance for both orientations: only its frame changes.
                 previewLayer(insets: insets)
                     .ignoresSafeArea()
-                if isLandscape { landscapeOverlay } else { portraitOverlay }
+                if isLandscape { landscapeOverlay(screen: screen, insets: insets) } else { portraitOverlay }
                 errorBanner
                 // Shutter flash.
                 Color.black.opacity(flash ? 1 : 0)
@@ -44,6 +50,9 @@ struct CameraScreen: View {
             }
         }
         .animation(.easeInOut(duration: 0.25), value: state.mode)
+        .animation(.easeInOut(duration: 0.25), value: orientation)
+        .onAppear { orientationObserver.start() }
+        .onDisappear { orientationObserver.stop() }
         .sheet(isPresented: $showGear) { GearPickerView(camera: camera) }
         .fullScreenCover(isPresented: $showViewer) {
             MediaViewerView(ids: camera.state.recentAssetIDs, onForget: { camera.forgetAssets($0) })
@@ -121,13 +130,39 @@ struct CameraScreen: View {
 
     // MARK: Landscape overlay
 
-    private var landscapeOverlay: some View {
-        HStack(spacing: 0) {
-            Spacer(minLength: 0)
-            landscapeColumn
-                .frame(width: columnWidth)
-                .background(barBackground.ignoresSafeArea())
+    /// Canvas geometry (landscape canvas coordinates: size = (screenH, screenW)).
+    private func landscapeGeometry(screen: CGSize, insets: EdgeInsets)
+        -> (canvas: CGSize, lead: CGFloat, trail: CGFloat, viewfinder: CGRect) {
+        let canvas = CGSize(width: screen.height, height: screen.width)
+        // -90: canvas trailing = screen top, leading = screen bottom. +90: swapped.
+        let lead = orientation == .landscapeLeftSideDown ? insets.top : insets.bottom
+        let trail = orientation == .landscapeLeftSideDown ? insets.bottom : insets.top
+        let area = CGRect(x: lead, y: 0,
+                          width: max(canvas.width - columnWidth - trail - lead, 1),
+                          height: canvas.height)
+        let aspect: CGFloat = state.mode.isVideo ? 16.0 / 9.0 : state.gear.body.photoAspect
+        return (canvas, lead, trail, fitted(in: area, aspect: aspect))
+    }
+
+    private func landscapeOverlay(screen: CGSize, insets: EdgeInsets) -> some View {
+        let g = landscapeGeometry(screen: screen, insets: insets)
+        return ZStack {
+            ViewfinderHUD(state: state)
+                .frame(width: g.viewfinder.width, height: g.viewfinder.height, alignment: .bottom)
+                .position(x: g.viewfinder.midX, y: g.viewfinder.midY)
+                .allowsHitTesting(false)
+            HStack(spacing: 0) {
+                Spacer(minLength: 0).allowsHitTesting(false)
+                landscapeColumn
+                    .padding(.trailing, g.trail)
+                    .frame(width: columnWidth + g.trail)
+                    .background(barBackground)
+            }
         }
+        .frame(width: g.canvas.width, height: g.canvas.height)
+        .rotationEffect(.degrees(canvasDegrees))
+        .position(x: screen.width / 2, y: screen.height / 2)
+        .ignoresSafeArea()
     }
 
     private var landscapeColumn: some View {
@@ -175,14 +210,12 @@ struct CameraScreen: View {
     }
 
     /// Preview and HUD rects in the full-screen coordinate space of `previewLayer`.
+    /// In landscape the HUD lives in the rotated canvas, so `hud` is unused there.
     private func layoutRects(full: CGSize, insets: EdgeInsets, origin: CGPoint) -> (preview: CGRect, hud: CGRect) {
         let screen = CGRect(origin: .zero, size: full)
         if isLandscape {
-            let area = CGRect(x: insets.leading, y: 0,
-                              width: max(full.width - columnWidth - insets.trailing - insets.leading, 1),
-                              height: full.height)
-            let aspect: CGFloat = state.mode.isVideo ? 16.0 / 9.0 : state.gear.body.photoAspect
-            let r = fitted(in: area, aspect: aspect)
+            let g = landscapeGeometry(screen: full, insets: insets)
+            let r = canvasRectToScreen(g.viewfinder, canvas: g.canvas, screen: full, degrees: canvasDegrees)
             return (r, r)
         }
         var slot = slotFrame.offsetBy(dx: -origin.x, dy: -origin.y)
@@ -204,12 +237,14 @@ struct CameraScreen: View {
                     .frame(width: r.preview.width, height: r.preview.height)
                     .clipped()
                     .contentShape(Rectangle())
-                    .simultaneousGesture(swipeGesture(axis: isLandscape ? .vertical : .horizontal))
+                    .simultaneousGesture(swipeGesture())
                     .position(x: r.preview.midX, y: r.preview.midY)
-                ViewfinderHUD(state: state)
-                    .frame(width: r.hud.width, height: r.hud.height, alignment: .bottom)
-                    .position(x: r.hud.midX, y: r.hud.midY)
-                    .allowsHitTesting(false)
+                if !isLandscape {
+                    ViewfinderHUD(state: state)
+                        .frame(width: r.hud.width, height: r.hud.height, alignment: .bottom)
+                        .position(x: r.hud.midX, y: r.hud.midY)
+                        .allowsHitTesting(false)
+                }
             }
         }
     }
@@ -240,12 +275,21 @@ struct CameraScreen: View {
         }
     }
 
-    /// Swipe on the viewfinder switches mode (horizontal in portrait, vertical in landscape).
-    private func swipeGesture(axis: Axis) -> some Gesture {
+    /// Swipe on the viewfinder switches mode. Portrait: screen horizontal. Landscape: along the user's
+    /// vertical axis = screen x; canvas height = screen x for -90, -screen x for +90.
+    private func swipeGesture() -> some Gesture {
         DragGesture(minimumDistance: 40)
             .onEnded { g in
-                let primary = axis == .horizontal ? g.translation.width : g.translation.height
-                let secondary = axis == .horizontal ? g.translation.height : g.translation.width
+                let primary: CGFloat
+                let secondary: CGFloat
+                switch orientation {
+                case .portrait:
+                    primary = g.translation.width; secondary = g.translation.height
+                case .landscapeRightSideDown:
+                    primary = g.translation.width; secondary = g.translation.height
+                case .landscapeLeftSideDown:
+                    primary = -g.translation.width; secondary = g.translation.height
+                }
                 guard !state.isRecording, abs(primary) > abs(secondary) * 1.5 else { return }
                 let modes = CameraMode.allCases
                 guard let i = modes.firstIndex(of: state.mode) else { return }
