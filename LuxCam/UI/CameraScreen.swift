@@ -41,8 +41,16 @@ struct CameraScreen: View {
                 // One preview instance for both orientations: only its frame changes.
                 previewLayer(insets: insets)
                     .ignoresSafeArea()
-                if isLandscape { landscapeOverlay(screen: screen, insets: insets) } else { portraitOverlay }
-                errorBanner
+                if isLandscape {
+                    // Identity per orientation: flipping between the two landscapes cross-fades
+                    // instead of spinning the overlay 180°.
+                    landscapeOverlay(screen: screen, insets: insets)
+                        .id(orientation)
+                        .transition(.opacity)
+                } else {
+                    portraitOverlay
+                    errorBanner
+                }
                 // Shutter flash.
                 Color.black.opacity(flash ? 1 : 0)
                     .ignoresSafeArea()
@@ -151,6 +159,10 @@ struct CameraScreen: View {
                 .frame(width: g.viewfinder.width, height: g.viewfinder.height, alignment: .bottom)
                 .position(x: g.viewfinder.midX, y: g.viewfinder.midY)
                 .allowsHitTesting(false)
+            // Error banner inside the rotated canvas so it reads in landscape, over the viewfinder only.
+            errorBanner
+                .frame(width: g.viewfinder.width, height: g.canvas.height)
+                .position(x: g.viewfinder.midX, y: g.canvas.height / 2)
             HStack(spacing: 0) {
                 Spacer(minLength: 0).allowsHitTesting(false)
                 landscapeColumn

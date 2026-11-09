@@ -4,7 +4,7 @@
 import SwiftUI
 import CoreMotion
 
-enum PhysicalOrientation: Equatable {
+enum PhysicalOrientation: Hashable {
     case portrait
     /// Gravity x > 0: the phone's right side points down (phone turned clockwise, Dynamic Island on
     /// the user's right). The user's "up" is screen -x; the overlay canvas is rotated -90°.
@@ -42,13 +42,19 @@ final class DeviceOrientationObserver: ObservableObject {
         motion.stopAccelerometerUpdates()
     }
 
+    /// Classifies the in-plane angle of gravity, so landscape is still detected when the camera is
+    /// pitched down at a table or up at the sky. Hysteresis: enter landscape beyond ±60°, return to
+    /// portrait within ±30°. Too flat (face up/down) or upside down keeps the last value.
     private func update(gx: Double, gy: Double) {
+        let planar = (gx * gx + gy * gy).squareRoot()
+        guard planar > 0.35 else { return }                  // nearly flat: keep last
+        let deg = atan2(gx, -gy) * 180 / Double.pi           // 0 = upright, +90 = right side down
         var next = orientation
-        if gx > 0.75 && abs(gx) > abs(gy) {
+        if deg > 60 && deg < 150 {
             next = .landscapeRightSideDown
-        } else if gx < -0.75 && abs(gx) > abs(gy) {
+        } else if deg < -60 && deg > -150 {
             next = .landscapeLeftSideDown
-        } else if gy < -0.6 && abs(gy) > abs(gx) {
+        } else if abs(deg) < 30 {
             next = .portrait
         }
         if next != orientation { orientation = next }
