@@ -54,10 +54,14 @@ struct CameraPreviewView: UIViewRepresentable {
   `LookRendering.apply(_:gear:aperture:cheap:to:isLogSource:)`.
 
 ## Orientation
-- UI supports portrait + both landscapes. Landscape layout is chosen with `verticalSizeClass == .compact`.
-- Preview orients frames from the window scene's interface orientation.
-- Capture uses `AVCaptureDevice.RotationCoordinator` (`videoRotationAngleForHorizonLevelCapture`) at
-  photo capture / record start. Never rotate the video data output connection.
+- The interface is locked to portrait (Info.plist). Like the stock Camera app, landscape is detected
+  from the PHYSICAL device orientation (CoreMotion gravity), so it works with the rotation lock on.
+- The preview is never rotated: frames are always oriented `.right` (portrait interface), which shows the
+  scene correctly however the phone is held. Tap mapping therefore stays the portrait mapping.
+- In physical landscape only the overlay UI (bars, chips, dials, mode strip, shutter rail, HUD) is laid
+  out in a rotated (±90°) landscape canvas, so all text reads correctly.
+- Capture uses `AVCaptureDevice.RotationCoordinator` (`videoRotationAngleForHorizonLevelCapture`, gravity
+  based) at photo capture / record start. Never rotate the video data output connection.
 
 ## Captured media history
 - Every successful save to Photos records the created asset's `localIdentifier`
