@@ -11,17 +11,40 @@ import UniformTypeIdentifiers
 
 struct ShareSheet: UIViewControllerRepresentable {
     let items: [Any]
+    var onFinish: (() -> Void)? = nil
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
+        let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        vc.completionWithItemsHandler = { _, _, _, _ in onFinish?() }
+        return vc
     }
 
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 private struct ShareItem: Identifiable {
-    let id = UUID()
+    let id: UUID
     let items: [Any]
+}
+
+/// Temporary share exports live in `tmp/LuxCamShare/<UUID>/` and are removed after sharing and on launch.
+enum ShareStorage {
+    static var root: URL {
+        URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("LuxCamShare", isDirectory: true)
+    }
+
+    static func directory(for id: UUID) -> URL {
+        root.appendingPathComponent(id.uuidString, isDirectory: true)
+    }
+
+    static func remove(_ id: UUID) {
+        try? FileManager.default.removeItem(at: directory(for: id))
+    }
+
+    static func sweep() {
+        try? FileManager.default.removeItem(at: root)
+    }
 }
 
 // MARK: - Viewer
@@ -39,6 +62,7 @@ struct MediaViewerView: View {
     @State private var shareItem: ShareItem?
     @State private var isPreparingShare = false
     @State private var rawIDs: Set<String> = []
+    @State private var rawChecked: Set<String> = []
     @State private var showChrome = true
 
     private static let bottomBarHeight: CGFloat = 52
@@ -72,9 +96,13 @@ struct MediaViewerView: View {
             }
         }
         .preferredColorScheme(.dark)
-        .onAppear { checkAccess() }
-        .sheet(item: $shareItem) { item in
-            ShareSheet(items: item.items)
+        .onAppear {
+            ShareStorage.sweep()
+            checkAccess()
+        }
+        .onChange(of: currentID) { _, _ in computeRAW() }
+        .sheet(item: $shareItem, onDismiss: { ShareStorage.sweep() }) { item in
+            ShareSheet(items: item.items, onFinish: { ShareStorage.remove(item.id) })
         }
     }
 
@@ -275,9 +303,23 @@ struct MediaViewerView: View {
     private func reload() {
         let result = MediaLibrary.fetch(ids: ids)
         assets = result.assets
-        rawIDs = Set(result.assets.filter { MediaLibrary.hasRAW($0) }.map { $0.localIdentifier })
         if !result.missing.isEmpty { onForget(result.missing) }
         if currentIndex == nil { currentID = assets.first?.localIdentifier ?? "" }
+        computeRAW()
+    }
+
+    /// Resource lookup for the current asset only, off the main thread, cached per identifier.
+    private func computeRAW() {
+        guard let asset = currentAsset, asset.mediaType == .image else { return }
+        let id = asset.localIdentifier
+        guard !rawChecked.contains(id) else { return }
+        rawChecked.insert(id)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let raw = MediaLibrary.hasRAW(asset)
+            DispatchQueue.main.async {
+                if raw { rawIDs.insert(id) }
+            }
+        }
     }
 
     // MARK: Actions
@@ -285,6 +327,7 @@ struct MediaViewerView: View {
     private func share() {
         guard let asset = currentAsset, !isPreparingShare else { return }
         isPreparingShare = true
+        let shareID = UUID()
         let resources = PHAssetResource.assetResources(for: asset)
         if asset.mediaType == .video {
             let resource = resources.first { $0.type == .fullSizeVideo }
@@ -293,9 +336,9 @@ struct MediaViewerView: View {
                 isPreparingShare = false
                 return
             }
-            Self.export(resource) { url in
+            Self.export(resource, shareID: shareID) { url in
                 isPreparingShare = false
-                if let url { shareItem = ShareItem(items: [url]) }
+                if let url { shareItem = ShareItem(id: shareID, items: [url]) }
             }
         } else {
             let dng = resources.first { $0.type == .alternatePhoto }
@@ -306,8 +349,7 @@ struct MediaViewerView: View {
                 var photoURL: URL?
                 if let data {
                     let ext = uti.flatMap { UTType($0)?.preferredFilenameExtension } ?? "jpg"
-                    let dir = FileManager.default.temporaryDirectory
-                        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                    let dir = ShareStorage.directory(for: shareID)
                     let url = dir.appendingPathComponent("LuxCam-\(Int(Date().timeIntervalSince1970)).\(ext)")
                     do {
                         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -320,13 +362,13 @@ struct MediaViewerView: View {
                 DispatchQueue.main.async {
                     guard let dng else {
                         isPreparingShare = false
-                        if let photoURL { shareItem = ShareItem(items: [photoURL]) }
+                        if let photoURL { shareItem = ShareItem(id: shareID, items: [photoURL]) }
                         return
                     }
-                    Self.export(dng) { rawURL in
+                    Self.export(dng, shareID: shareID) { rawURL in
                         isPreparingShare = false
                         let urls = [photoURL, rawURL].compactMap { $0 }
-                        if !urls.isEmpty { shareItem = ShareItem(items: urls) }
+                        if !urls.isEmpty { shareItem = ShareItem(id: shareID, items: urls) }
                     }
                 }
             }
@@ -334,9 +376,8 @@ struct MediaViewerView: View {
     }
 
     /// Writes the original resource data to a temp file. `completion` runs on the main queue.
-    private static func export(_ resource: PHAssetResource, completion: @escaping (URL?) -> Void) {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    private static func export(_ resource: PHAssetResource, shareID: UUID, completion: @escaping (URL?) -> Void) {
+        let dir = ShareStorage.directory(for: shareID)
         let url = dir.appendingPathComponent(resource.originalFilename)
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -398,6 +439,31 @@ private struct PhotoPageView: View {
     @State private var requestID: PHImageRequestID?
     @State private var scale: CGFloat = 1
     @State private var baseScale: CGFloat = 1
+    @State private var offset: CGSize = .zero
+    @State private var baseOffset: CGSize = .zero
+    @State private var hiResRequested = false
+    @State private var hiResID: PHImageRequestID?
+
+    /// Size of the aspect-fit image inside `container`.
+    private func fittedSize(in container: CGSize) -> CGSize {
+        let pw = CGFloat(asset.pixelWidth), ph = CGFloat(asset.pixelHeight)
+        guard pw > 0, ph > 0, container.width > 0, container.height > 0 else { return container }
+        let r = min(container.width / pw, container.height / ph)
+        return CGSize(width: pw * r, height: ph * r)
+    }
+
+    private func clamped(_ o: CGSize, container: CGSize, scale: CGFloat) -> CGSize {
+        let f = fittedSize(in: container)
+        let maxX = max(0, (f.width * scale - container.width) / 2)
+        let maxY = max(0, (f.height * scale - container.height) / 2)
+        return CGSize(width: min(maxX, max(-maxX, o.width)),
+                      height: min(maxY, max(-maxY, o.height)))
+    }
+
+    private func resetZoom() {
+        scale = 1; baseScale = 1
+        offset = .zero; baseOffset = .zero
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -409,20 +475,38 @@ private struct PhotoPageView: View {
                         .scaledToFit()
                         .frame(width: geo.size.width, height: geo.size.height)
                         .scaleEffect(scale)
+                        .offset(offset)
+                        .highPriorityGesture(
+                            DragGesture()
+                                .onChanged { value in
+                                    let proposed = CGSize(width: baseOffset.width + value.translation.width,
+                                                          height: baseOffset.height + value.translation.height)
+                                    offset = clamped(proposed, container: geo.size, scale: scale)
+                                }
+                                .onEnded { _ in baseOffset = offset },
+                            including: scale > 1 ? .all : .subviews
+                        )
                         .gesture(
                             MagnificationGesture()
                                 .onChanged { value in
                                     scale = min(4, max(1, baseScale * value))
+                                    offset = clamped(offset, container: geo.size, scale: scale)
+                                    if scale > 1.5 { requestHighRes(viewSize: geo.size) }
                                 }
                                 .onEnded { _ in
                                     baseScale = scale
+                                    baseOffset = offset
                                 }
                         )
                         .onTapGesture(count: 2) {
                             withAnimation(.easeInOut(duration: 0.2)) {
-                                scale = scale > 1.01 ? 1 : 2.5
-                                baseScale = scale
+                                if scale > 1.01 {
+                                    resetZoom()
+                                } else {
+                                    scale = 2.5; baseScale = 2.5
+                                }
                             }
+                            if scale > 1.5 { requestHighRes(viewSize: geo.size) }
                         }
                 } else if failed {
                     Text("表示できません")
@@ -439,7 +523,7 @@ private struct PhotoPageView: View {
             .onAppear { load(viewSize: geo.size) }
         }
         .onChange(of: isCurrent) { _, current in
-            if !current { scale = 1; baseScale = 1 }
+            if !current { resetZoom() }
         }
         .onDisappear { cancel() }
     }
@@ -458,11 +542,37 @@ private struct PhotoPageView: View {
         ) { result, info in
             let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) == true
             DispatchQueue.main.async {
-                if let result { image = result }
+                if let result, !hiResRequested { image = result }
                 if !degraded {
                     requestID = nil
                     if result == nil && image == nil { failed = true }
                 }
+            }
+        }
+    }
+
+    /// One-time higher-resolution request once the user zooms in.
+    private func requestHighRes(viewSize: CGSize) {
+        guard !hiResRequested, image != nil else { return }
+        hiResRequested = true
+        let pixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
+        let target: CGSize
+        if pixels <= 24_000_000 {
+            target = PHImageManagerMaximumSize
+        } else {
+            let side = max(viewSize.width, viewSize.height, 1) * displayScale * 3
+            target = CGSize(width: side, height: side)
+        }
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .highQualityFormat
+        options.isNetworkAccessAllowed = true
+        options.resizeMode = .fast
+        hiResID = PHImageManager.default().requestImage(
+            for: asset, targetSize: target, contentMode: .aspectFit, options: options
+        ) { result, _ in
+            DispatchQueue.main.async {
+                hiResID = nil
+                if let result { image = result }
             }
         }
     }
@@ -472,6 +582,11 @@ private struct PhotoPageView: View {
             PHImageManager.default().cancelImageRequest(id)
         }
         requestID = nil
+        if let id = hiResID {
+            PHImageManager.default().cancelImageRequest(id)
+            hiResRequested = false
+        }
+        hiResID = nil
     }
 }
 

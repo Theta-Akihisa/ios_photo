@@ -84,7 +84,6 @@ struct ManualControlsView: View {
         }
         .animation(.easeInOut(duration: 0.2), value: selected)
         .sheet(isPresented: $model.showFormat) { VideoFormatView(camera: camera) }
-        .sheet(isPresented: $model.showGear) { GearPickerView(camera: camera) }
     }
 
     // MARK: Chips

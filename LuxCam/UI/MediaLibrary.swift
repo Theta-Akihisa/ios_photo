@@ -5,12 +5,8 @@ import Photos
 import UIKit
 
 enum MediaLibrary {
-    static var readStatus: PHAuthorizationStatus {
-        PHPhotoLibrary.authorizationStatus(for: .readWrite)
-    }
-
     static var canRead: Bool {
-        let s = readStatus
+        let s = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         return s == .authorized || s == .limited
     }
 
