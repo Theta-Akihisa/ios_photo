@@ -18,6 +18,9 @@ final class CameraService: NSObject, ObservableObject {
     func set(video: VideoFormatSettings)
     func set(photoFormat: PhotoFormat)      // HEIF or Apple ProRAW (DNG); ProRAW ignores looks
     func clearError()                       // main thread: clears state.errorMessage (error banner dismissed)
+    func suspendForViewer()                 // main thread: stop the session while the media viewer is open
+                                            // (waits for in-flight photos); start() is a no-op while suspended
+    func resumeFromViewer()                 // main thread: clear the suspension and start()
     func forgetAssets(_ ids: [String])      // drop deleted/missing assets from state.recentAssetIDs (+ persist)
     func set(gear: GearSelection)           // body + lens; normalises lens, enforces body.allows(look)
     func set(simulatedAperture: Float)
