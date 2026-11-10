@@ -33,7 +33,8 @@ extension LookRenderer {
 
     func apply(_ preset: LookPreset, gear: GearSelection?, aperture: Float?, cheap: Bool,
                to image: CIImage, isLogSource: Bool) -> CIImage {
-        let base = apply(preset, to: image, isLogSource: isLogSource)
+        // With a gear the lens character owns vignetting, so the Leica look vignette is skipped.
+        let base = apply(preset, to: image, isLogSource: isLogSource, includeVignette: (gear?.lens.character.vignette ?? 0) <= 0.001)
         guard let gear = gear else { return base }
         let ext = image.extent
         guard !ext.isInfinite, !ext.isEmpty else { return base }

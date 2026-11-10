@@ -13,10 +13,14 @@ final class CameraService: NSObject, ObservableObject {
     func start()                            // requests permission, configures + starts session (non-blocking)
     func stop()
     func set(mode: CameraMode)
-    func set(look: LookPreset)
+    func set(look: LookPreset)              // ignored when !state.gear.body.allows(look)
     func set(manual: ManualSettings)
     func set(video: VideoFormatSettings)
     func set(photoFormat: PhotoFormat)      // HEIF or Apple ProRAW (DNG); ProRAW ignores looks
+    func clearError()                       // main thread: clears state.errorMessage (error banner dismissed)
+    func suspendForViewer()                 // main thread: stop the session while the media viewer is open
+                                            // (waits for in-flight photos); start() is a no-op while suspended
+    func resumeFromViewer()                 // main thread: clear the suspension and start()
     func forgetAssets(_ ids: [String])      // drop deleted/missing assets from state.recentAssetIDs (+ persist)
     func set(gear: GearSelection)           // body + lens; normalises lens, enforces body.allows(look)
     func set(simulatedAperture: Float)
@@ -38,8 +42,10 @@ final class LookRenderer: LookRendering, @unchecked Sendable {
 ## Preview (owner C) — `LuxCam/Preview/`
 ```swift
 struct CameraPreviewView: UIViewRepresentable {
-    init(frames: PreviewFrameSource, look: LookPreset, renderer: LookRendering,
-         onTap: @escaping (_ devicePoint: CGPoint) -> Void)
+    init(frames: PreviewFrameSource, look: LookPreset, gear: GearSelection = GearSelection(),
+         aperture: Float? = nil, renderer: LookRendering,
+         onTap: @escaping (_ devicePoint: CGPoint) -> Void,
+         onTapViewPoint: ((CGPoint) -> Void)? = nil)
 }
 ```
 

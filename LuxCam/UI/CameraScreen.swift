@@ -10,13 +10,12 @@ struct CameraScreen: View {
     @StateObject private var orientationObserver = DeviceOrientationObserver()
 
     @State private var showGrid = false
-    @State private var showGear = false
     @State private var reticlePoint: CGPoint = .zero
     @State private var reticleVisible = false
     @State private var reticleToken = UUID()
     @State private var flash = false
-    @State private var dismissedError: String?
     @State private var showViewer = false
+    @State private var errorToken: UUID?
     @State private var fallbackThumbnail: UIImage?
     @StateObject private var manualModel = ManualControlsModel()
     /// Portrait viewfinder slot (global coordinates), reported by the overlay layout.
@@ -61,13 +60,26 @@ struct CameraScreen: View {
         .animation(.easeInOut(duration: 0.25), value: orientation)
         .onAppear { orientationObserver.start() }
         .onDisappear { orientationObserver.stop() }
-        .sheet(isPresented: $showGear) { GearPickerView(camera: camera) }
+        .sheet(isPresented: $manualModel.showGear) { GearPickerView(camera: camera) }
         .fullScreenCover(isPresented: $showViewer) {
             MediaViewerView(ids: camera.state.recentAssetIDs, onForget: { camera.forgetAssets($0) })
         }
         .onAppear { loadFallbackThumbnail() }
         .onChange(of: showViewer) { _, shown in
-            if !shown { loadFallbackThumbnail() }
+            if shown {
+                camera.suspendForViewer()
+            } else {
+                camera.resumeFromViewer()
+                loadFallbackThumbnail()
+            }
+        }
+        .onChange(of: state.errorMessage) { _, message in
+            errorToken = message == nil ? nil : UUID()
+        }
+        .task(id: errorToken) {
+            guard errorToken != nil else { return }
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            if !Task.isCancelled { camera.clearError() }
         }
         .onChange(of: state.lastThumbnail == nil) { _, isNil in
             if isNil { loadFallbackThumbnail() }
@@ -95,7 +107,7 @@ struct CameraScreen: View {
 
     private var portraitOverlay: some View {
         VStack(spacing: 0) {
-            TopBarView(state: state, onGearTap: { showGear = true })
+            TopBarView(state: state, onGearTap: { manualModel.showGear = true })
                 .background(barBackground)
                 .fixedSize(horizontal: false, vertical: true)
             // The flexible area between the top bar and the controls. It only reserves space and
@@ -179,7 +191,7 @@ struct CameraScreen: View {
 
     private var landscapeColumn: some View {
         VStack(spacing: 6) {
-            LandscapeInfoView(state: state, onGearTap: { showGear = true })
+            LandscapeInfoView(state: state, onGearTap: { manualModel.showGear = true })
                 .padding(.top, 6)
             ScrollView(.vertical, showsIndicators: false) {
                 ManualControlsView(camera: camera, model: manualModel, compact: true)
@@ -350,7 +362,7 @@ struct CameraScreen: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(!hasMedia || state.isRecording)
+        .disabled(!hasMedia || state.isRecording || state.isCapturingPhoto)
         .accessibilityLabel("最新の撮影")
     }
 
@@ -373,7 +385,7 @@ struct CameraScreen: View {
 
     @ViewBuilder
     private var errorBanner: some View {
-        if let message = state.errorMessage, message != dismissedError {
+        if let message = state.errorMessage {
             VStack {
                 HStack(spacing: 10) {
                     RedDot(size: 7)
@@ -389,7 +401,7 @@ struct CameraScreen: View {
                 .overlay(Rectangle().stroke(Theme.red, lineWidth: 0.5))
                 .padding(.horizontal, Theme.gutter)
                 .padding(.top, 48)
-                .onTapGesture { dismissedError = message }
+                .onTapGesture { camera.clearError() }
                 Spacer()
             }
             .transition(.opacity)

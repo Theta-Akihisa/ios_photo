@@ -9,6 +9,7 @@ import CoreVideo
 
 enum MovieRecorderError: Error {
     case cannotAddInput
+    case writeFailed
 }
 
 final class MovieRecorder {
@@ -30,6 +31,18 @@ final class MovieRecorder {
     private var finished = false
     private var failed = false
     private var startTime = CMTime.invalid
+    private var failureReported = false
+    private var mismatchedFrames = 0
+    /// Called (asynchronously, once) when the writer fails while recording, so the owner can stop and clean up.
+    var onFailure: (() -> Void)?
+
+    private func reportFailureLocked() {
+        failed = true
+        guard !failureReported else { return }
+        failureReported = true
+        let handler = onFailure
+        DispatchQueue.global(qos: .userInitiated).async { handler?() }
+    }
 
     /// - Parameters:
     ///   - audioSettings: output settings for the audio input; nil with `hasAudio` uses AAC mono.
@@ -111,14 +124,24 @@ final class MovieRecorder {
         defer { lock.unlock() }
         guard !finished, !failed else { return }
 
+        // Frames must match the writer size (the output buffer mode may have just changed): drop stale ones.
+        guard CVPixelBufferGetWidth(pixelBuffer) == width, CVPixelBufferGetHeight(pixelBuffer) == height else {
+            if !sessionStarted {
+                mismatchedFrames += 1
+                if mismatchedFrames >= 30 { reportFailureLocked() }
+            }
+            return
+        }
+        mismatchedFrames = 0
+
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
         if !sessionStarted {
-            guard writer.startWriting() else { failed = true; return }
+            guard writer.startWriting() else { reportFailureLocked(); return }
             writer.startSession(atSourceTime: pts)
             startTime = pts
             sessionStarted = true
         }
-        guard writer.status == .writing else { failed = true; return }
+        guard writer.status == .writing else { reportFailureLocked(); return }
         guard videoInput.isReadyForMoreMediaData, let pool = adaptor.pixelBufferPool else { return }
 
         var out: CVPixelBuffer?
@@ -137,7 +160,7 @@ final class MovieRecorder {
         context.render(image, to: dst, bounds: extent, colorSpace: outputColorSpace)
 
         if !adaptor.append(dst, withPresentationTime: pts) {
-            failed = true
+            reportFailureLocked()
         }
     }
 
@@ -149,7 +172,7 @@ final class MovieRecorder {
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
         // Drop audio that precedes the first video frame.
         if CMTimeCompare(pts, startTime) < 0 { return }
-        if !audioInput.append(sample) { failed = true }
+        if !audioInput.append(sample) { reportFailureLocked() }
     }
 
     // MARK: Finish
@@ -173,7 +196,9 @@ final class MovieRecorder {
         guard canFinish else {
             if writer.status == .writing { writer.cancelWriting() }
             try? FileManager.default.removeItem(at: url)
-            completion(nil, writer.error)
+            var failure: Error? = writer.error
+            if failure == nil && (failed || !sessionStarted) { failure = MovieRecorderError.writeFailed }
+            completion(nil, failure)
             return
         }
         let w = writer
@@ -183,7 +208,7 @@ final class MovieRecorder {
                 completion(u, nil)
             } else {
                 try? FileManager.default.removeItem(at: u)
-                completion(nil, w.error)
+                completion(nil, w.error ?? MovieRecorderError.writeFailed)
             }
         }
     }

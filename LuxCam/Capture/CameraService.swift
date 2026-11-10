@@ -29,6 +29,55 @@ private final class RenderShared: @unchecked Sendable {
     }
 }
 
+/// UIKit background task that is ended exactly once, from any thread. `begin()` must run on main.
+private final class BackgroundTask: @unchecked Sendable {
+    private let lock = NSLock()
+    private let name: String
+    private var id = UIBackgroundTaskIdentifier.invalid
+    private var began = false
+    private var ended = false
+
+    init(name: String) { self.name = name }
+
+    /// Main thread only.
+    func begin() {
+        lock.lock()
+        if began || ended { lock.unlock(); return }
+        began = true
+        lock.unlock()
+        let newID = MainActor.assumeIsolated {
+            UIApplication.shared.beginBackgroundTask(withName: name) { [self] in
+                end()
+            }
+        }
+        lock.lock()
+        if ended {
+            lock.unlock()
+            MainActor.assumeIsolated { UIApplication.shared.endBackgroundTask(newID) }
+        } else {
+            id = newID
+            lock.unlock()
+        }
+    }
+
+    func end() {
+        lock.lock()
+        if ended { lock.unlock(); return }
+        ended = true
+        let taskID = id
+        id = .invalid
+        lock.unlock()
+        guard taskID != .invalid else { return }
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { UIApplication.shared.endBackgroundTask(taskID) }
+        } else {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { UIApplication.shared.endBackgroundTask(taskID) }
+            }
+        }
+    }
+}
+
 private enum RecordingPhase { case idle, recording, finalizing }
 private enum RecordingKind { case baked(MovieRecorder), movieFile }
 
@@ -133,6 +182,15 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     private var recordingKind: RecordingKind?
     private var runtimeObserver: NSObjectProtocol?
     private var stopAfterRecording = false
+    /// Main-thread flag: the media viewer is open, the session must stay stopped.
+    private var suspendedForViewer = false
+    /// sessionQueue: stop the session once in-flight photos have drained (viewer opened mid-capture).
+    private var stopAfterPhotos = false
+    /// True once reconfigure() has completed successfully (false = a full reconfigure is needed on start()).
+    private var configDirty = true
+    /// Whether videoDataOutput currently delivers full-size (format-sized) frames; false = preview-sized.
+    private var fullSizeBuffers = true
+    private var recordBG: BackgroundTask?
 
     /// Configuration mirror used on sessionQueue.
     private struct QueueConfig {
@@ -172,6 +230,10 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     /// Main thread only. Drops the given IDs from the history (e.g. after deletion).
+    func clearError() {
+        updateState { $0.errorMessage = nil }
+    }
+
     func forgetAssets(_ ids: [String]) {
         let drop = Set(ids)
         // The camera screen thumbnail shows the newest capture; clear it if that one is gone
@@ -192,6 +254,10 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         self.ciContext = ctx
         self.photoProcessor = PhotoProcessor(renderer: lookRenderer, context: ctx)
         super.init()
+
+        DispatchQueue.global(qos: .utility).async {
+            CaptureFormats.removeStaleTemporaryMovies(olderThan: 3600)
+        }
 
         if let saved = UserDefaults.standard.stringArray(forKey: Self.recentAssetsKey) {
             state.recentAssetIDs = Array(saved.prefix(Self.recentAssetsCap))
@@ -217,6 +283,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     // MARK: - Public API
 
     func start() {
+        if suspendedForViewer { return }
         let snapshot = state
         requestPermissions { [weak self] videoGranted in
             guard let self = self else { return }
@@ -229,8 +296,21 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                     && !self.pendingReconfigure
                 self.wantsRunning = true
                 self.stopAfterRecording = false
+                self.stopAfterPhotos = false
                 if alreadyRunning {
                     // onAppear + scenePhase can both call start(); don't reconfigure twice.
+                    self.publishRunning()
+                    return
+                }
+                if self.videoInput != nil, !self.configDirty, !self.pendingReconfigure {
+                    // Configured before and only stopped (e.g. backgrounded): just resume the session.
+                    if self.phase == .idle, !self.session.isRunning {
+                        self.session.startRunning()
+                        if let dev = self.device {
+                            self.applyGearZoom(on: dev)
+                            self.applyManualSettings()
+                        }
+                    }
                     self.publishRunning()
                     return
                 }
@@ -248,6 +328,28 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                 self.publishRunning()
             }
         }
+    }
+
+    /// Main thread. Stops the session while the media viewer is open (deferred until in-flight photos finish).
+    func suspendForViewer() {
+        suspendedForViewer = true
+        sessionQueue.async { [self] in
+            guard phase == .idle else { return }
+            // Also stops the runtime-error observer from restarting the session behind the viewer.
+            wantsRunning = false
+            if !inflightPhotos.isEmpty {
+                stopAfterPhotos = true
+            } else if session.isRunning {
+                session.stopRunning()
+                publishRunning()
+            }
+        }
+    }
+
+    /// Main thread. Clears the viewer suspension and restarts the camera.
+    func resumeFromViewer() {
+        suspendedForViewer = false
+        start()
     }
 
     func stop() {
@@ -279,10 +381,12 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     func set(look: LookPreset) {
+        guard state.gear.body.allows(look) else { return }
         state.look = look
         shared.setLook(look)
         sessionQueue.async { [self] in
             q.look = look
+            if phase == .idle { updateVideoBufferMode() }
             if q.mode == .photo, let dev = device, session.outputs.contains(photoOutput) {
                 updatePhotoDimensions(mode: q.mode, device: dev)
             }
@@ -376,6 +480,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                 if q.mode == .photo, session.outputs.contains(photoOutput) {
                     updatePhotoDimensions(mode: q.mode, device: dev)
                 }
+                updateVideoBufferMode()
                 publishCapabilities(device: dev, cinematicActive: false)
             } else {
                 reconfigure()      // new camera (or deferred until recording ends)
@@ -420,11 +525,14 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         let look = state.look
         let gear = state.gear
         let aperture = state.simulatedAperture
+        let bg = BackgroundTask(name: "LuxCam.photo")
+        bg.begin()
 
         sessionQueue.async { [self] in
             guard session.isRunning, session.outputs.contains(photoOutput) else {
                 publishError("Camera is not ready.")
                 updateState { $0.pendingPhotos = max(0, $0.pendingPhotos - 1) }
+                bg.end()
                 return
             }
             if let conn = photoOutput.connection(with: .video) {
@@ -435,13 +543,13 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                 }
             }
             if mode == .photo, q.photoFormat == .proRAW, !photoOutput.isAppleProRAWEnabled {
-                updateState { $0.errorMessage = "ProRAW を有効にできませんでした。HEIF で保存します。" }
+                postMessage("ProRAW を有効にできませんでした。HEIF で保存します。")
             }
             let settings = makePhotoSettings(mode: mode)
             let id = settings.uniqueID
             let delegate = PhotoCaptureDelegate { [weak self] data, rawData, error in
                 self?.photoCaptureFinished(id: id, data: data, rawData: rawData, error: error,
-                                           mode: mode, look: look, gear: gear, aperture: aperture)
+                                           mode: mode, look: look, gear: gear, aperture: aperture, bg: bg)
             }
             delegate.onWillCapture = { [weak self] in
                 // Shutter moment: flash / haptic in the UI.
@@ -482,8 +590,22 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Shows `message` in the error banner; re-shows identical text even if it was never cleared.
+    private func postMessage(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if self.state.errorMessage == message {
+                self.state.errorMessage = nil
+                DispatchQueue.main.async { [weak self] in self?.state.errorMessage = message }
+            } else {
+                self.state.errorMessage = message
+            }
+        }
+    }
+
     private func publishError(_ message: String) {
-        updateState { $0.errorMessage = message; $0.isCapturingPhoto = false }
+        postMessage(message)
+        updateState { $0.isCapturingPhoto = false }
     }
 
     private func publishRunning() {
@@ -514,6 +636,8 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
 
         let mode = q.mode
         let isVideoMode = mode.isVideo
+        configDirty = true
+        var notes: [String] = []
 
         session.beginConfiguration()
         for o in observers { o.invalidate() }
@@ -567,30 +691,41 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             session.sessionPreset = .inputPriority
             session.automaticallyConfiguresCaptureDeviceForWideColor = false
 
-            effective = q.video
-            var format: AVCaptureDevice.Format?
             if mode == .cinematic {
                 effective = VideoFormatSettings()
                 effective.frameRate = 30
-                format = CinematicSupport.bestFormat(for: dev)
-                cinematicActive = (format != nil)
-                if format == nil { effective.frameRate = 24 }   // fallback: plain 24 fps HEVC video
-            }
-            if format == nil { format = CaptureFormats.bestVideoFormat(for: dev, settings: effective) }
-            if format == nil {
-                effective.color = .standard
-                format = CaptureFormats.bestVideoFormat(for: dev, settings: effective)
-            }
-            if let fmt = format {
-                isLog = applyFormat(fmt, to: dev, settings: effective)
-                if mode == .video, let note = CaptureFormats.mismatchNote(fmt, settings: effective) {
-                    publishError(note)
+                if let cf = CinematicSupport.bestFormat(for: dev) {
+                    isLog = applyFormat(cf, to: dev, settings: effective)
+                    let ok = CinematicSupport.setEnabled(true, input: input, device: dev)
+                    if ok { CinematicSupport.setAperture(q.aperture, input: input, device: dev) }
+                    cinematicActive = ok
                 }
-            }
-            if cinematicActive {
-                let ok = CinematicSupport.setEnabled(true, input: input, device: dev)
-                if ok { CinematicSupport.setAperture(q.aperture, input: input, device: dev) }
-                cinematicActive = ok
+                if !cinematicActive {
+                    // Fallback: plain 24 fps HEVC video.
+                    effective = VideoFormatSettings()
+                    effective.frameRate = 24
+                    isLog = false
+                    if let fmt = CaptureFormats.bestVideoFormat(for: dev, settings: effective) {
+                        isLog = applyFormat(fmt, to: dev, settings: effective)
+                    }
+                    notes.append("この端末/設定ではシネマティックを利用できないため通常の動画で記録します")
+                }
+            } else {
+                effective = q.video
+                var format = CaptureFormats.bestVideoFormat(for: dev, settings: effective)
+                if format == nil {
+                    effective.color = .standard
+                    format = CaptureFormats.bestVideoFormat(for: dev, settings: effective)
+                }
+                if let fmt = format {
+                    isLog = applyFormat(fmt, to: dev, settings: effective)
+                    if effective.color == .appleLog && !isLog { effective.color = .standard }
+                    if effective.color == .hlg && dev.activeColorSpace != .HLG_BT2020 { effective.color = .standard }
+                    if let note = CaptureFormats.mismatchNote(fmt, settings: effective) { notes.append(note) }
+                }
+                if effective.color != q.video.color {
+                    notes.append("このカメラ/フォーマットでは LOG（または HDR）を使えないため SDR で記録します")
+                }
             }
 
             if audioInput != nil, session.canAddOutput(audioDataOutput) {
@@ -609,21 +744,27 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                     .min(by: { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }) {
                     photoOutput.maxPhotoDimensions = smallest
                 }
+                // Depth / matte / ProRAW / dimensions / responsive capture belong inside the configuration.
+                configurePhotoOutput(mode: mode, device: dev)
             }
         }
 
         q.effective = effective
         session.commitConfiguration()
 
-        // Gear zoom must come after the format is final (changing activeFormat resets the zoom factor).
+        // Gear zoom must come after the format and depth settings are final (they can reset the zoom factor).
         applyGearZoom(on: dev)
 
         // Post-commit configuration (needs live connections).
         if isVideoMode {
-            configureMovieOutput(effective: effective)
-        } else {
-            configurePhotoOutput(mode: mode, device: dev)
+            if let note = configureMovieOutput(effective: effective) { notes.append(note) }
+        } else if session.outputs.contains(photoOutput) {
+            // Photo size depends on the zoom (48 MP is only used unzoomed).
+            updatePhotoDimensions(mode: mode, device: dev)
         }
+        updateVideoBufferMode()
+        if !notes.isEmpty { postMessage(notes.joined(separator: "\n")) }
+        configDirty = false
 
         shared.setLog(isLog)
         applyManualSettings()
@@ -745,9 +886,10 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func configureMovieOutput(effective: VideoFormatSettings) {
-        guard session.outputs.contains(movieOutput) else { return }
-        guard let conn = movieOutput.connection(with: .video) else { return }
+    /// Returns a user-facing note when the requested codec could not be used.
+    private func configureMovieOutput(effective: VideoFormatSettings) -> String? {
+        guard session.outputs.contains(movieOutput) else { return nil }
+        guard let conn = movieOutput.connection(with: .video) else { return nil }
         let angle = currentCaptureAngle()
         if conn.isVideoRotationAngleSupported(angle) { conn.videoRotationAngle = angle }
 
@@ -772,12 +914,39 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                 movieOutput.setOutputSettings([AVVideoCodecKey: codec.rawValue], for: conn)
             }
         } else {
-            publishError("この組み合わせではProResを使用できません（外部ストレージが必要な場合があります）")
             if available.contains(.hevc) {
                 movieOutput.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc.rawValue], for: conn)
             }
             q.effective.codec = .hevc
+            return "この組み合わせではProResを使用できません（外部ストレージが必要な場合があります）"
         }
+        return nil
+    }
+
+    /// Chooses full-size vs preview-sized frames for the preview/baking output. Full-size frames are only
+    /// needed while a look/gear is baked into the file; otherwise preview-sized buffers save a lot of work.
+    /// Returns true if the mode changed. sessionQueue; not while a recording is running.
+    @discardableResult
+    private func updateVideoBufferMode() -> Bool {
+        let full = wantsBakedRecording(look: q.look, gear: q.gear)
+        guard full != fullSizeBuffers else { return false }
+        session.beginConfiguration()
+        if full {
+            videoDataOutput.deliversPreviewSizedOutputBuffers = false
+            videoDataOutput.automaticallyConfiguresOutputBufferDimensions = false
+            videoDataOutput.deliversPreviewSizedOutputBuffers = false
+        } else {
+            videoDataOutput.automaticallyConfiguresOutputBufferDimensions = false
+            videoDataOutput.deliversPreviewSizedOutputBuffers = true
+        }
+        session.commitConfiguration()
+        fullSizeBuffers = full
+        return true
+    }
+
+    /// True when a recording started now would render a look / gear into the file (AVAssetWriter path).
+    private func wantsBakedRecording(look: LookPreset, gear: GearSelection) -> Bool {
+        q.mode == .video && q.effective.bakesLook && (look != .native || !CaptureFormats.isNeutral(gear))
     }
 
     // MARK: - Capabilities
@@ -786,8 +955,8 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     private func computeStaticCapabilities() {
         guard !staticCapsComputed else { return }
         staticCapsComputed = true
-        if let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) {
-            knownCaps.cinematic = CinematicSupport.deviceSupportsCinematic(wide)
+        if let cinematicDevice = CaptureFormats.captureDevice(for: .cinematic) {
+            knownCaps.cinematic = CinematicSupport.deviceSupportsCinematic(cinematicDevice)
         }
         knownCaps.portraitDepth = CaptureFormats.hasDepthCapableDevice()
     }
@@ -864,7 +1033,12 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func applyGearZoom(on dev: AVCaptureDevice) {
-        let target = gearZoom(for: dev)
+        var target = gearZoom(for: dev)
+        if q.mode == .cinematic, dev.isVirtualDevice,
+           let first = dev.virtualDeviceSwitchOverVideoZoomFactors.first {
+            // Virtual device: zoom 1 is the ultra wide; the first switch-over factor frames the 24mm wide.
+            target = CGFloat(truncating: first)
+        }
         do { try dev.lockForConfiguration() } catch { return }
         defer { dev.unlockForConfiguration() }
         if dev.isRampingVideoZoom { dev.cancelVideoZoomRamp() }
@@ -1032,8 +1206,18 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func photoCaptureFinished(id: Int64, data: Data?, rawData: Data?, error: Error?,
-                                      mode: CameraMode, look: LookPreset, gear: GearSelection, aperture: Float) {
-        sessionQueue.async { [self] in inflightPhotos[id] = nil }
+                                      mode: CameraMode, look: LookPreset, gear: GearSelection, aperture: Float,
+                                      bg: BackgroundTask) {
+        sessionQueue.async { [self] in
+            inflightPhotos[id] = nil
+            if stopAfterPhotos, inflightPhotos.isEmpty {
+                stopAfterPhotos = false
+                if phase == .idle, session.isRunning {
+                    session.stopRunning()
+                    publishRunning()
+                }
+            }
+        }
 
         // If only the DNG arrived, save it as the primary resource without processing.
         let primary = data ?? rawData
@@ -1041,6 +1225,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         guard let primary = primary else {
             publishError(error?.localizedDescription ?? "Photo capture failed.")
             updateState { $0.pendingPhotos = max(0, $0.pendingPhotos - 1) }
+            bg.end()
             return
         }
         let dng = (data != nil) ? rawData : nil
@@ -1049,23 +1234,25 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
             if data != nil {
                 // The processed companion of a ProRAW pair is left uncropped / un-geared like the 4:3 DNG.
                 let isRAWPair = (rawData != nil)
-                output = photoProcessor.process(data: primary, mode: mode, look: look,
+                output = photoProcessor.process(data: primary, mode: mode,
+                                                look: isRAWPair ? LookPreset.native : look,
                                                 gear: isRAWPair ? GearSelection() : gear,
                                                 aperture: aperture, cropToBody: !isRAWPair)
             } else {
                 output = PhotoProcessor.Output(data: primary, thumbnail: LibrarySaver.photoThumbnail(from: primary))
             }
             LibrarySaver.savePhoto(data: output.data, rawDNG: dng, isDNG: primaryIsDNG) { [weak self] ok, saveError, assetID in
-                guard let self = self else { return }
+                guard let self = self else { bg.end(); return }
                 DispatchQueue.main.async {
                     self.state.pendingPhotos = max(0, self.state.pendingPhotos - 1)
                     if ok {
                         if let assetID = assetID { self.recordAsset(assetID) }
                         if let thumb = output.thumbnail { self.state.lastThumbnail = thumb }
                     } else {
-                        self.state.errorMessage = saveError?.localizedDescription
-                            ?? "Could not save the photo. Check Photos permission."
+                        self.postMessage(saveError?.localizedDescription
+                            ?? "Could not save the photo. Check Photos permission.")
                     }
+                    bg.end()
                 }
             }
         }
@@ -1077,15 +1264,14 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         guard q.mode.isVideo, session.isRunning, device != nil else { return }
         let look = q.look
         let gear = q.gear
-        let baked = (q.mode == .video) && q.effective.bakesLook
+        let baked = wantsBakedRecording(look: look, gear: gear)
+        // Make sure the frames delivered to the writer are full size (look may have changed just now).
+        updateVideoBufferMode()
 
         if baked {
-            // Prefer the real pixel-buffer size of the preview frames.
+            // Always size the writer from the active format (preview frames may be stale / preview-sized).
             var w = 0, h = 0
-            if let latest = frames.latest() {
-                w = CVPixelBufferGetWidth(latest.buffer)
-                h = CVPixelBufferGetHeight(latest.buffer)
-            } else if let fmt = device?.activeFormat {
+            if let fmt = device?.activeFormat {
                 let d = CaptureFormats.dimensions(fmt)
                 w = d.w; h = d.h
             }
@@ -1105,6 +1291,13 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                     hasAudio: audioInput != nil, audioSettings: audioSettings,
                     renderer: lookRenderer, context: ciContext,
                     metadata: CaptureFormats.lookMetadata(look, gear: gear))
+                recorder.onFailure = { [weak self] in
+                    // The writer failed on its own: stop, finalise and surface the error.
+                    self?.sessionQueue.async { [weak self] in
+                        guard let self = self, self.phase == .recording else { return }
+                        self.stopRecordingOnQueue()
+                    }
+                }
                 recordingKind = .baked(recorder)
                 shared.setRecorder(recorder)
             } catch {
@@ -1137,6 +1330,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     private func stopRecordingOnQueue() {
         guard phase == .recording else { return }
         phase = .finalizing
+        beginRecordBG()
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.recordTimer?.invalidate()
@@ -1158,27 +1352,57 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// sessionQueue only. Keeps the app alive while the file is finalised and saved.
+    private func beginRecordBG() {
+        guard recordBG == nil else { return }
+        let bg = BackgroundTask(name: "LuxCam.video")
+        recordBG = bg
+        DispatchQueue.main.async { bg.begin() }
+    }
+
+    private func endRecordBG() {
+        recordBG?.end()
+        recordBG = nil
+    }
+
     /// Called from any queue once the file is complete (or failed).
     private func recordingFinished(url: URL?, error: Error?) {
-        guard let url = url else {
-            publishError("Recording failed: \(error?.localizedDescription ?? "unknown error")")
-            sessionQueue.async { [self] in finishRecordingCleanup() }
-            return
-        }
-        processingQueue.async { [weak self] in
-            let thumb = LibrarySaver.videoThumbnail(url: url)
-            LibrarySaver.saveVideo(url: url) { ok, saveError, assetID in
-                guard let self = self else { return }
-                DispatchQueue.main.async {
-                    if ok {
-                        if let assetID = assetID { self.recordAsset(assetID) }
-                        if let thumb = thumb { self.state.lastThumbnail = thumb }
-                    } else {
-                        self.state.errorMessage = saveError?.localizedDescription
-                            ?? "Could not save the video. Check Photos permission."
-                    }
+        sessionQueue.async { [self] in
+            if phase == .recording {
+                phase = .finalizing
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.recordTimer?.invalidate()
+                    self.recordTimer = nil
+                    self.state.isRecording = false
+                    self.state.recordingSeconds = 0
                 }
-                self.sessionQueue.async { self.finishRecordingCleanup() }
+            }
+            beginRecordBG()      // also covers recordings that ended without a stop request
+            guard let url = url else {
+                if let error = error {
+                    postMessage("録画が中断されました: \(error.localizedDescription)")
+                } else {
+                    postMessage("録画を保存できませんでした")
+                }
+                finishRecordingCleanup()
+                return
+            }
+            processingQueue.async { [weak self] in
+                let thumb = LibrarySaver.videoThumbnail(url: url)
+                LibrarySaver.saveVideo(url: url) { ok, saveError, assetID in
+                    guard let self = self else { return }
+                    DispatchQueue.main.async {
+                        if ok {
+                            if let assetID = assetID { self.recordAsset(assetID) }
+                            if let thumb = thumb { self.state.lastThumbnail = thumb }
+                        } else {
+                            self.postMessage(saveError?.localizedDescription
+                                ?? "Could not save the video. Check Photos permission.")
+                        }
+                    }
+                    self.sessionQueue.async { self.finishRecordingCleanup() }
+                }
             }
         }
     }
@@ -1186,6 +1410,16 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     private func finishRecordingCleanup() {
         phase = .idle
         recordingKind = nil
+        shared.setRecorder(nil)
+        endRecordBG()
+        // The recording may have ended without a stop request (disk full, interruption, ProRes without SSD).
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.recordTimer?.invalidate()
+            self.recordTimer = nil
+            self.state.isRecording = false
+            self.state.recordingSeconds = 0
+        }
         if stopAfterRecording {
             // stop() was requested while recording; honour it now that the file is finalised.
             stopAfterRecording = false
@@ -1198,6 +1432,8 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         if pendingReconfigure {
             pendingReconfigure = false
             reconfigure()
+        } else {
+            updateVideoBufferMode()
         }
     }
 
@@ -1244,6 +1480,10 @@ extension CameraService: AVCaptureFileOutputRecordingDelegate {
             success = ok
         }
         if success {
+            if let error = error {
+                // File is usable, but the recording ended on its own (e.g. disk full).
+                postMessage("録画が中断されました: \(error.localizedDescription)")
+            }
             recordingFinished(url: outputFileURL, error: nil)
         } else {
             try? FileManager.default.removeItem(at: outputFileURL)
