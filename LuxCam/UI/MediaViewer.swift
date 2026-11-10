@@ -608,7 +608,8 @@ private struct VideoPageView: View {
         ZStack {
             Theme.black
             if let player {
-                VideoPlayer(player: player)
+                // Own controls: SwiftUI's VideoPlayer showed its round buttons without glyphs on iOS 26.
+                LuxVideoPlayer(player: player)
                     .padding(.bottom, bottomInset)
             } else {
                 ProgressView().tint(Theme.text)
