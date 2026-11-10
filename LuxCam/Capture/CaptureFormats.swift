@@ -11,6 +11,12 @@ enum CaptureFormats {
 
     /// Back camera for the mode. PORTRAIT prefers a depth-capable virtual device.
     static func captureDevice(for mode: CameraMode) -> AVCaptureDevice? {
+        if mode == .cinematic {
+            // iOS 26 Cinematic Video is offered on the dual-wide virtual device (not the plain wide camera).
+            if let dualWide = AVCaptureDevice.default(.builtInDualWideCamera, for: .video, position: .back) {
+                return dualWide
+            }
+        }
         if mode == .portrait {
             let found = AVCaptureDevice.DiscoverySession(
                 deviceTypes: depthCapableTypes, mediaType: .video, position: .back).devices
@@ -181,7 +187,9 @@ enum CaptureFormats {
             } else if is10Bit422(f) {
                 s -= 5
             }
-            if is10Bit(f) { s += 10 }
+            // The 10-bit bonus only applies when a 10-bit source is actually wanted (HDR / Log / ProRes);
+            // plain SDR needs a format that offers sRGB.
+            if is10Bit(f) && (settings.color != .standard || settings.codec.isProRes) { s += 10 }
             return s
         }
 
@@ -194,7 +202,12 @@ enum CaptureFormats {
                 if requireFPS && !supportsFPS(f, fps) { return false }
                 return true
             }
-            return list.max(by: { score($0) < score($1) })
+            var candidates = list
+            if settings.color == .standard && !wantRAW {
+                let srgb = list.filter { supports($0, colorSpace: .sRGB) }
+                if !srgb.isEmpty { candidates = srgb }
+            }
+            return candidates.max(by: { score($0) < score($1) })
         }
 
         return pick(requireFPS: true, requireRes: true)
@@ -222,6 +235,22 @@ enum CaptureFormats {
     static func temporaryMovieURL() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("luxcam-\(UUID().uuidString).mov")
+    }
+
+    /// Deletes leftover temp movies (`luxcam-*.mov`) older than `age` seconds (crash / kill during recording).
+    static func removeStaleTemporaryMovies(olderThan age: TimeInterval = 3600) {
+        let fm = FileManager.default
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        guard let files = try? fm.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.contentModificationDateKey], options: []) else { return }
+        let cutoff = Date().addingTimeInterval(-age)
+        for url in files where url.lastPathComponent.hasPrefix("luxcam-") && url.pathExtension == "mov" {
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate
+            if let modified = modified, modified < cutoff {
+                try? fm.removeItem(at: url)
+            }
+        }
     }
 
     /// Metadata items storing the look name inside the movie.
