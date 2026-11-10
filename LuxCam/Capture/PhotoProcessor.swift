@@ -26,11 +26,14 @@ final class PhotoProcessor {
     /// `cropToBody` is false for the processed companion of a ProRAW capture (the DNG stays 4:3).
     func process(data: Data, mode: CameraMode, look: LookPreset, gear: GearSelection,
                  aperture: Float, cropToBody: Bool = true) -> Output {
-        let original = Output(data: data, thumbnail: LibrarySaver.photoThumbnail(from: data))
         let wantsPortrait = (mode == .portrait)
         let wantsCrop = cropToBody && abs(gear.body.photoAspect - 4.0 / 3.0) > 0.001
         let wantsGear = !CaptureFormats.isNeutral(gear)
-        if !wantsPortrait && look == .native && !wantsCrop && !wantsGear { return original }
+        // Nothing to do (e.g. ProRAW companion): return the original untouched, without decoding.
+        if !wantsPortrait && look == .native && !wantsCrop && !wantsGear {
+            return Output(data: data, thumbnail: LibrarySaver.photoThumbnail(from: data))
+        }
+        let original = Output(data: data, thumbnail: LibrarySaver.photoThumbnail(from: data))
 
         // Orientation is baked into the pixels so every auxiliary image lines up.
         guard let base = CIImage(data: data, options: [.applyOrientationProperty: true]) else { return original }
@@ -39,7 +42,7 @@ final class PhotoProcessor {
         var modified = false
 
         if wantsPortrait, let blurred = depthBlur(data: data, base: base, aperture: aperture) {
-            image = blurred.cropped(to: extent)
+            image = fit(blurred, to: extent).cropped(to: extent)
             modified = true
         }
         if wantsCrop, let rect = cropRect(for: extent, aspect: gear.body.photoAspect) {
@@ -85,6 +88,37 @@ final class PhotoProcessor {
     // MARK: Portrait
 
     private func depthBlur(data: Data, base: CIImage, aperture: Float) -> CIImage? {
+        if let out = systemDepthBlur(data: data, aperture: aperture) { return out }
+        return handBuiltDepthBlur(data: data, base: base, aperture: aperture)
+    }
+
+    /// Uses CIContext's depthBlurEffectFilter (ObjC `depthBlurEffectFilterForImageData:options:`), which wires up
+    /// disparity, matte, focus rect and calibration from the photo's auxiliary data. The selector is called
+    /// dynamically so a Swift spelling mismatch cannot break the build; nil when unavailable.
+    private func systemDepthBlur(data: Data, aperture: Float) -> CIImage? {
+        let selector = Selector(("depthBlurEffectFilterForImageData:options:"))
+        guard context.responds(to: selector),
+              let unmanaged = context.perform(selector, with: data as NSData, with: nil),
+              let filter = unmanaged.takeUnretainedValue() as? CIFilter else { return nil }
+        if filter.inputKeys.contains("inputAperture") {
+            filter.setValue(NSNumber(value: min(max(aperture, 1.0), 22.0)), forKey: "inputAperture")
+        }
+        guard let output = filter.outputImage else { return nil }
+        // The filter works in native (unoriented) pixel space; the pipeline is upright.
+        var orientation: Int32 = 1
+        if let props = CIImage(data: data)?.properties,
+           let value = props[kCGImagePropertyOrientation as String] as? NSNumber {
+            orientation = value.int32Value
+        }
+        guard orientation >= 1, orientation <= 8 else { return output }
+        let upright = orientation == 1 ? output : output.oriented(forExifOrientation: orientation)
+        // Normalise the origin to zero like the oriented base image.
+        let e = upright.extent
+        if e.isInfinite || e.isEmpty { return nil }
+        return upright.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
+    }
+
+    private func handBuiltDepthBlur(data: Data, base: CIImage, aperture: Float) -> CIImage? {
         guard let disparity = CIImage(data: data, options: [.auxiliaryDisparity: true,
                                                             .applyOrientationProperty: true]) else { return nil }
         let target = base.extent

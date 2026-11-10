@@ -10,7 +10,7 @@ final class LookRenderer: LookRendering, @unchecked Sendable {
     static let shared = LookRenderer()
 
     static let cubeDimension = 33
-    static let logCubeDimension = 65
+    static let logCubeDimension = 64   // CIColorCube maximum
 
     /// Subtle vignette for the Leica family. Cheap; can be switched off.
     var enableVignette: Bool {
@@ -31,19 +31,25 @@ final class LookRenderer: LookRendering, @unchecked Sendable {
     // MARK: LookRendering
 
     func apply(_ preset: LookPreset, to image: CIImage, isLogSource: Bool) -> CIImage {
+        apply(preset, to: image, isLogSource: isLogSource, includeVignette: true)
+    }
+
+    /// `includeVignette: false` is used by the gear-aware API (the lens character owns vignetting).
+    func apply(_ preset: LookPreset, to image: CIImage, isLogSource: Bool, includeVignette: Bool) -> CIImage {
         var out = image
         if isLogSource {
             out = colorCube(out, data: logToDisplayCubeData(), dimension: Self.logCubeDimension)
         }
         guard preset != .native else { return out }
         out = colorCube(out, data: cubeData(for: preset), dimension: Self.cubeDimension)
-        if preset.family == .leica && enableVignette {
+        if includeVignette && preset.family == .leica && enableVignette {
             out = vignette(out)
         }
         return out
     }
 
-    /// Generates all cubes up front (call off the render path, e.g. at launch).
+    /// Generates all cubes up front. Thread-safe (cube generation is lock-guarded), so it may be called from a
+    /// background queue. Should be called at launch (e.g. `LookRenderer.shared.prewarm()` from the App).
     func prewarm() {
         _ = logToDisplayCubeData()
         for p in LookPreset.allCases { _ = cubeData(for: p) }
