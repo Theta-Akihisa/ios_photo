@@ -182,6 +182,10 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     private var recordingKind: RecordingKind?
     private var runtimeObserver: NSObjectProtocol?
     private var stopAfterRecording = false
+    /// Main-thread flag: the media viewer is open, the session must stay stopped.
+    private var suspendedForViewer = false
+    /// sessionQueue: stop the session once in-flight photos have drained (viewer opened mid-capture).
+    private var stopAfterPhotos = false
     /// True once reconfigure() has completed successfully (false = a full reconfigure is needed on start()).
     private var configDirty = true
     /// Whether videoDataOutput currently delivers full-size (format-sized) frames; false = preview-sized.
@@ -279,6 +283,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     // MARK: - Public API
 
     func start() {
+        if suspendedForViewer { return }
         let snapshot = state
         requestPermissions { [weak self] videoGranted in
             guard let self = self else { return }
@@ -291,6 +296,7 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                     && !self.pendingReconfigure
                 self.wantsRunning = true
                 self.stopAfterRecording = false
+                self.stopAfterPhotos = false
                 if alreadyRunning {
                     // onAppear + scenePhase can both call start(); don't reconfigure twice.
                     self.publishRunning()
@@ -298,7 +304,13 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                 }
                 if self.videoInput != nil, !self.configDirty, !self.pendingReconfigure {
                     // Configured before and only stopped (e.g. backgrounded): just resume the session.
-                    if self.phase == .idle, !self.session.isRunning { self.session.startRunning() }
+                    if self.phase == .idle, !self.session.isRunning {
+                        self.session.startRunning()
+                        if let dev = self.device {
+                            self.applyGearZoom(on: dev)
+                            self.applyManualSettings()
+                        }
+                    }
                     self.publishRunning()
                     return
                 }
@@ -316,6 +328,28 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
                 self.publishRunning()
             }
         }
+    }
+
+    /// Main thread. Stops the session while the media viewer is open (deferred until in-flight photos finish).
+    func suspendForViewer() {
+        suspendedForViewer = true
+        sessionQueue.async { [self] in
+            guard phase == .idle else { return }
+            // Also stops the runtime-error observer from restarting the session behind the viewer.
+            wantsRunning = false
+            if !inflightPhotos.isEmpty {
+                stopAfterPhotos = true
+            } else if session.isRunning {
+                session.stopRunning()
+                publishRunning()
+            }
+        }
+    }
+
+    /// Main thread. Clears the viewer suspension and restarts the camera.
+    func resumeFromViewer() {
+        suspendedForViewer = false
+        start()
     }
 
     func stop() {
@@ -899,7 +933,8 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         session.beginConfiguration()
         if full {
             videoDataOutput.deliversPreviewSizedOutputBuffers = false
-            videoDataOutput.automaticallyConfiguresOutputBufferDimensions = true
+            videoDataOutput.automaticallyConfiguresOutputBufferDimensions = false
+            videoDataOutput.deliversPreviewSizedOutputBuffers = false
         } else {
             videoDataOutput.automaticallyConfiguresOutputBufferDimensions = false
             videoDataOutput.deliversPreviewSizedOutputBuffers = true
@@ -1173,7 +1208,16 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     private func photoCaptureFinished(id: Int64, data: Data?, rawData: Data?, error: Error?,
                                       mode: CameraMode, look: LookPreset, gear: GearSelection, aperture: Float,
                                       bg: BackgroundTask) {
-        sessionQueue.async { [self] in inflightPhotos[id] = nil }
+        sessionQueue.async { [self] in
+            inflightPhotos[id] = nil
+            if stopAfterPhotos, inflightPhotos.isEmpty {
+                stopAfterPhotos = false
+                if phase == .idle, session.isRunning {
+                    session.stopRunning()
+                    publishRunning()
+                }
+            }
+        }
 
         // If only the DNG arrived, save it as the primary resource without processing.
         let primary = data ?? rawData
@@ -1222,15 +1266,12 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         let gear = q.gear
         let baked = wantsBakedRecording(look: look, gear: gear)
         // Make sure the frames delivered to the writer are full size (look may have changed just now).
-        let buffersChanged = updateVideoBufferMode()
+        updateVideoBufferMode()
 
         if baked {
-            // Prefer the real pixel-buffer size of the preview frames (the recorder drops mismatching frames).
+            // Always size the writer from the active format (preview frames may be stale / preview-sized).
             var w = 0, h = 0
-            if !buffersChanged, let latest = frames.latest() {
-                w = CVPixelBufferGetWidth(latest.buffer)
-                h = CVPixelBufferGetHeight(latest.buffer)
-            } else if let fmt = device?.activeFormat {
+            if let fmt = device?.activeFormat {
                 let d = CaptureFormats.dimensions(fmt)
                 w = d.w; h = d.h
             }
@@ -1327,10 +1368,22 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
     /// Called from any queue once the file is complete (or failed).
     private func recordingFinished(url: URL?, error: Error?) {
         sessionQueue.async { [self] in
+            if phase == .recording {
+                phase = .finalizing
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.recordTimer?.invalidate()
+                    self.recordTimer = nil
+                    self.state.isRecording = false
+                    self.state.recordingSeconds = 0
+                }
+            }
             beginRecordBG()      // also covers recordings that ended without a stop request
             guard let url = url else {
                 if let error = error {
                     postMessage("録画が中断されました: \(error.localizedDescription)")
+                } else {
+                    postMessage("録画を保存できませんでした")
                 }
                 finishRecordingCleanup()
                 return

@@ -15,6 +15,7 @@ struct CameraScreen: View {
     @State private var reticleToken = UUID()
     @State private var flash = false
     @State private var showViewer = false
+    @State private var errorToken: UUID?
     @State private var fallbackThumbnail: UIImage?
     @StateObject private var manualModel = ManualControlsModel()
     /// Portrait viewfinder slot (global coordinates), reported by the overlay layout.
@@ -66,17 +67,19 @@ struct CameraScreen: View {
         .onAppear { loadFallbackThumbnail() }
         .onChange(of: showViewer) { _, shown in
             if shown {
-                camera.stop()
+                camera.suspendForViewer()
             } else {
-                camera.start()
+                camera.resumeFromViewer()
                 loadFallbackThumbnail()
             }
         }
         .onChange(of: state.errorMessage) { _, message in
-            guard let message else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-                if camera.state.errorMessage == message { camera.clearError() }
-            }
+            errorToken = message == nil ? nil : UUID()
+        }
+        .task(id: errorToken) {
+            guard errorToken != nil else { return }
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            if !Task.isCancelled { camera.clearError() }
         }
         .onChange(of: state.lastThumbnail == nil) { _, isNil in
             if isNil { loadFallbackThumbnail() }
@@ -359,7 +362,7 @@ struct CameraScreen: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(!hasMedia || state.isRecording)
+        .disabled(!hasMedia || state.isRecording || state.isCapturingPhoto)
         .accessibilityLabel("最新の撮影")
     }
 

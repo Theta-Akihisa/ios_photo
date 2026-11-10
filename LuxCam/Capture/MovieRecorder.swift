@@ -32,6 +32,7 @@ final class MovieRecorder {
     private var failed = false
     private var startTime = CMTime.invalid
     private var failureReported = false
+    private var mismatchedFrames = 0
     /// Called (asynchronously, once) when the writer fails while recording, so the owner can stop and clean up.
     var onFailure: (() -> Void)?
 
@@ -124,7 +125,14 @@ final class MovieRecorder {
         guard !finished, !failed else { return }
 
         // Frames must match the writer size (the output buffer mode may have just changed): drop stale ones.
-        guard CVPixelBufferGetWidth(pixelBuffer) == width, CVPixelBufferGetHeight(pixelBuffer) == height else { return }
+        guard CVPixelBufferGetWidth(pixelBuffer) == width, CVPixelBufferGetHeight(pixelBuffer) == height else {
+            if !sessionStarted {
+                mismatchedFrames += 1
+                if mismatchedFrames >= 30 { reportFailureLocked() }
+            }
+            return
+        }
+        mismatchedFrames = 0
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
         if !sessionStarted {
@@ -189,7 +197,7 @@ final class MovieRecorder {
             if writer.status == .writing { writer.cancelWriting() }
             try? FileManager.default.removeItem(at: url)
             var failure: Error? = writer.error
-            if failure == nil && failed { failure = MovieRecorderError.writeFailed }
+            if failure == nil && (failed || !sessionStarted) { failure = MovieRecorderError.writeFailed }
             completion(nil, failure)
             return
         }

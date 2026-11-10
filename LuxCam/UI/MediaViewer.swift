@@ -11,11 +11,9 @@ import UniformTypeIdentifiers
 
 struct ShareSheet: UIViewControllerRepresentable {
     let items: [Any]
-    var onFinish: (() -> Void)? = nil
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
         let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)
-        vc.completionWithItemsHandler = { _, _, _, _ in onFinish?() }
         return vc
     }
 
@@ -102,7 +100,7 @@ struct MediaViewerView: View {
         }
         .onChange(of: currentID) { _, _ in computeRAW() }
         .sheet(item: $shareItem, onDismiss: { ShareStorage.sweep() }) { item in
-            ShareSheet(items: item.items, onFinish: { ShareStorage.remove(item.id) })
+            ShareSheet(items: item.items)
         }
     }
 
@@ -146,6 +144,8 @@ struct MediaViewerView: View {
         }
     }
 
+    @State private var isZoomed = false
+
     private func pager(bottomSafeInset: CGFloat) -> some View {
         ZStack {
             TabView(selection: $currentID) {
@@ -155,6 +155,8 @@ struct MediaViewerView: View {
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
+            .scrollDisabled(isZoomed)
+            .onChange(of: currentID) { _, _ in isZoomed = false }
             .ignoresSafeArea()
 
             if showChrome {
@@ -175,7 +177,7 @@ struct MediaViewerView: View {
             VideoPageView(asset: asset, isCurrent: isCurrent,
                           bottomInset: (showChrome ? Self.bottomBarHeight : 0) + bottomSafeInset)
         } else {
-            PhotoPageView(asset: asset, isCurrent: isCurrent, onTap: {
+            PhotoPageView(asset: asset, isCurrent: isCurrent, isZoomed: $isZoomed, onTap: {
                 withAnimation(.easeInOut(duration: 0.2)) { showChrome.toggle() }
             })
         }
@@ -431,6 +433,7 @@ struct MediaViewerView: View {
 private struct PhotoPageView: View {
     let asset: PHAsset
     let isCurrent: Bool
+    @Binding var isZoomed: Bool
     let onTap: () -> Void
 
     @Environment(\.displayScale) private var displayScale
@@ -476,6 +479,7 @@ private struct PhotoPageView: View {
                         .frame(width: geo.size.width, height: geo.size.height)
                         .scaleEffect(scale)
                         .offset(offset)
+                        .onChange(of: scale > 1.001) { _, z in if isCurrent { isZoomed = z } }
                         .highPriorityGesture(
                             DragGesture()
                                 .onChanged { value in
@@ -557,10 +561,10 @@ private struct PhotoPageView: View {
         hiResRequested = true
         let pixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
         let target: CGSize
-        if pixels <= 24_000_000 {
+        if pixels <= 12_000_000 {
             target = PHImageManagerMaximumSize
         } else {
-            let side = max(viewSize.width, viewSize.height, 1) * displayScale * 3
+            let side = min(max(viewSize.width, viewSize.height, 1) * displayScale * 3, 4096)
             target = CGSize(width: side, height: side)
         }
         let options = PHImageRequestOptions()

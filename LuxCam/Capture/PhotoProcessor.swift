@@ -88,14 +88,14 @@ final class PhotoProcessor {
     // MARK: Portrait
 
     private func depthBlur(data: Data, base: CIImage, aperture: Float) -> CIImage? {
-        if let out = systemDepthBlur(data: data, aperture: aperture) { return out }
+        if let out = systemDepthBlur(data: data, base: base, aperture: aperture) { return out }
         return handBuiltDepthBlur(data: data, base: base, aperture: aperture)
     }
 
     /// Uses CIContext's depthBlurEffectFilter (ObjC `depthBlurEffectFilterForImageData:options:`), which wires up
     /// disparity, matte, focus rect and calibration from the photo's auxiliary data. The selector is called
     /// dynamically so a Swift spelling mismatch cannot break the build; nil when unavailable.
-    private func systemDepthBlur(data: Data, aperture: Float) -> CIImage? {
+    private func systemDepthBlur(data: Data, base: CIImage, aperture: Float) -> CIImage? {
         let selector = Selector(("depthBlurEffectFilterForImageData:options:"))
         guard context.responds(to: selector),
               let unmanaged = context.perform(selector, with: data as NSData, with: nil),
@@ -110,12 +110,25 @@ final class PhotoProcessor {
            let value = props[kCGImagePropertyOrientation as String] as? NSNumber {
             orientation = value.int32Value
         }
-        guard orientation >= 1, orientation <= 8 else { return output }
-        let upright = orientation == 1 ? output : output.oriented(forExifOrientation: orientation)
-        // Normalise the origin to zero like the oriented base image.
-        let e = upright.extent
-        if e.isInfinite || e.isEmpty { return nil }
-        return upright.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
+        let baseExtent = base.extent
+        guard !baseExtent.isEmpty, !baseExtent.isInfinite, baseExtent.height > 0 else { return nil }
+        let baseAspect = baseExtent.width / baseExtent.height
+        func matches(_ img: CIImage) -> Bool {
+            let e = img.extent
+            if e.isInfinite || e.isEmpty || e.height <= 0 { return false }
+            return abs((e.width / e.height) / baseAspect - 1) <= 0.02
+        }
+        func normalised(_ img: CIImage) -> CIImage {
+            let e = img.extent
+            return img.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
+        }
+        // Prefer the oriented candidate, fall back to the unoriented output, else let the hand-built path run.
+        if orientation >= 1, orientation <= 8, orientation != 1 {
+            let upright = output.oriented(forExifOrientation: orientation)
+            if matches(upright) { return normalised(upright) }
+        }
+        if matches(output) { return normalised(output) }
+        return nil
     }
 
     private func handBuiltDepthBlur(data: Data, base: CIImage, aperture: Float) -> CIImage? {
