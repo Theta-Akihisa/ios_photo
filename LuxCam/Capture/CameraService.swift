@@ -1232,12 +1232,12 @@ final class CameraService: NSObject, ObservableObject, @unchecked Sendable {
         processingQueue.async { [self] in
             let output: PhotoProcessor.Output
             if data != nil {
-                // The processed companion of a ProRAW pair is left uncropped / un-geared like the 4:3 DNG.
-                let isRAWPair = (rawData != nil)
-                output = photoProcessor.process(data: primary, mode: mode,
-                                                look: isRAWPair ? LookPreset.native : look,
-                                                gear: isRAWPair ? GearSelection() : gear,
-                                                aperture: aperture, cropToBody: !isRAWPair)
+                // The processed companion of a ProRAW pair is graded like a normal photo (the DNG stays untouched).
+                output = photoProcessor.process(data: primary, mode: mode, look: look, gear: gear,
+                                                aperture: aperture, cropToBody: true)
+                if output.failed {
+                    postMessage("ルックを適用できなかったため、元の写真を保存しました")
+                }
             } else {
                 output = PhotoProcessor.Output(data: primary, thumbnail: LibrarySaver.photoThumbnail(from: primary))
             }

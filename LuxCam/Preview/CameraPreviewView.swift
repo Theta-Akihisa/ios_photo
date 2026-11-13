@@ -48,6 +48,7 @@ struct CameraPreviewView: UIViewRepresentable {
         view.colorPixelFormat = .bgra8Unorm
         view.backgroundColor = .black
         view.isOpaque = true
+        (view.layer as? CAMetalLayer)?.colorspace = previewOutputColorSpace
         view.delegate = context.coordinator
 
         let tap = UITapGestureRecognizer(target: context.coordinator,
@@ -86,6 +87,8 @@ struct CameraPreviewView: UIViewRepresentable {
         private static let sharedContext: CIContext? = sharedDevice.map {
             CIContext(mtlDevice: $0, options: [.cacheIntermediates: false])
         }
+        private static let outputColorSpace: CGColorSpace =
+            previewOutputColorSpace
         var device: MTLDevice? { Self.sharedDevice }
         private var commandQueue: MTLCommandQueue? { Self.sharedQueue }
         private var ciContext: CIContext? { Self.sharedContext }
@@ -161,6 +164,24 @@ struct CameraPreviewView: UIViewRepresentable {
                                                        y: -oriented.extent.origin.y))
                     .transformed(by: CGAffineTransform(scaleX: s, y: s))
             }
+            // Crop (centred) to the view aspect BEFORE grading, like the photo path (body aspect first),
+            // so vignette/grain are relative to the visible frame. Visible region is unchanged.
+            do {
+                let se = source.extent
+                let target = size.width / size.height
+                if se.width > 0, se.height > 0 {
+                    var r = se
+                    if se.width / se.height > target {
+                        let w = (se.height * target).rounded()
+                        r = CGRect(x: (se.minX + (se.width - w) / 2).rounded(), y: se.minY, width: w, height: se.height)
+                    } else {
+                        let h = (se.width / target).rounded()
+                        r = CGRect(x: se.minX, y: (se.minY + (se.height - h) / 2).rounded(), width: se.width, height: h)
+                    }
+                    r = r.intersection(se)
+                    if r.width >= 1, r.height >= 1 { source = source.cropped(to: r) }
+                }
+            }
             let looked = renderer.apply(currentLook, gear: currentGear, aperture: currentAperture,
                                         cheap: false, to: source, isLogSource: isLog)
 
@@ -188,7 +209,7 @@ struct CameraPreviewView: UIViewRepresentable {
                   let cb = queue.makeCommandBuffer() else { return }
 
             ciContext.render(output, to: drawable.texture, commandBuffer: cb,
-                             bounds: bounds, colorSpace: CGColorSpaceCreateDeviceRGB())
+                             bounds: bounds, colorSpace: Self.outputColorSpace)
             cb.present(drawable)
             cb.commit()
 
@@ -242,3 +263,9 @@ struct CameraPreviewView: UIViewRepresentable {
         }
     }
 }
+
+/// Display P3 (matches saved photos), falling back to sRGB, then DeviceRGB.
+private let previewOutputColorSpace: CGColorSpace =
+    CGColorSpace(name: CGColorSpace.displayP3)
+    ?? CGColorSpace(name: CGColorSpace.sRGB)
+    ?? CGColorSpaceCreateDeviceRGB()
