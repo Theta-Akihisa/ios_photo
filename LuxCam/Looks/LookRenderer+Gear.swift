@@ -85,7 +85,7 @@ extension LookRenderer {
             let f = CIFilter.sharpenLuminance()
             f.inputImage = out
             f.sharpness = min(lens.sharpness * 0.6, 2)
-            f.radius = Float(min(max(ext.width / 1200, 0.8), 3))
+            f.radius = Float(min(max(ext.width / 1200, 0.8), 8))
             out = (f.outputImage ?? out).cropped(to: ext)
         }
         if !cheap && lens.bloom > eps {
@@ -144,8 +144,12 @@ extension LookRenderer {
         let n = CIFilter.colorMatrix()
         // The generator image is infinite and deterministic: shift it randomly per call so the
         // grain differs every frame instead of being a fixed pattern.
-        n.inputImage = noise.transformed(by: CGAffineTransform(translationX: CGFloat.random(in: 0..<512),
-                                                               y: CGFloat.random(in: 0..<512)))
+        // Grain size is normalised to a ~1600 px long side so preview and full-resolution photo look alike.
+        let s = max(1, max(ext.width, ext.height) / 1600)
+        n.inputImage = noise
+            .transformed(by: CGAffineTransform(scaleX: s, y: s))
+            .transformed(by: CGAffineTransform(translationX: CGFloat.random(in: 0..<512),
+                                               y: CGFloat.random(in: 0..<512)))
         n.rVector = CIVector(x: k, y: 0, z: 0, w: 0)
         n.gVector = CIVector(x: 0, y: k, z: 0, w: 0)
         n.bVector = CIVector(x: 0, y: 0, z: k, w: 0)
