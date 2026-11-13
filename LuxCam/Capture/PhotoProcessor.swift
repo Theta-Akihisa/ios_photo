@@ -12,6 +12,8 @@ final class PhotoProcessor {
     struct Output {
         let data: Data
         let thumbnail: UIImage?
+        /// True when the look could not be applied and `data` is the untouched original.
+        var failed: Bool = false
     }
 
     private let renderer: LookRendering
@@ -22,21 +24,38 @@ final class PhotoProcessor {
         self.context = context
     }
 
-    /// Returns the data to save. Falls back to the original data whenever processing fails.
-    /// `cropToBody` is false for the processed companion of a ProRAW capture (the DNG stays 4:3).
+    /// Returns the data to save. On failure the original data is returned with `failed == true`
+    /// (after logging the failing step), so the caller can tell the user.
+    /// `cropToBody` is false only where the caller wants the 4:3 frame kept.
     func process(data: Data, mode: CameraMode, look: LookPreset, gear: GearSelection,
                  aperture: Float, cropToBody: Bool = true) -> Output {
         let wantsPortrait = (mode == .portrait)
         let wantsCrop = cropToBody && abs(gear.body.photoAspect - 4.0 / 3.0) > 0.001
         let wantsGear = !CaptureFormats.isNeutral(gear)
-        // Nothing to do (e.g. ProRAW companion): return the original untouched, without decoding.
+        // Nothing to do: return the original untouched (keeps its HDR), without decoding.
         if !wantsPortrait && look == .native && !wantsCrop && !wantsGear {
             return Output(data: data, thumbnail: LibrarySaver.photoThumbnail(from: data))
         }
         let original = Output(data: data, thumbnail: LibrarySaver.photoThumbnail(from: data))
+        func fail(_ step: String) -> Output {
+            NSLog("LuxCam PhotoProcessor: \(step) failed")
+            return Output(data: data, thumbnail: original.thumbnail, failed: true)
+        }
 
         // Orientation is baked into the pixels so every auxiliary image lines up.
-        guard let base = CIImage(data: data, options: [.applyOrientationProperty: true]) else { return original }
+        guard let decoded = CIImage(data: data, options: [.applyOrientationProperty: true]) else {
+            return fail("decode")
+        }
+        let sourceProps = decoded.properties
+        let sourceExtent = decoded.extent
+        guard sourceExtent.width >= 2, sourceExtent.height >= 2, !sourceExtent.isInfinite else {
+            return fail("decode (empty extent)")
+        }
+        // Bound memory (e.g. 48 MP ProRAW companions): work on at most ~12.6 MP.
+        let pixels = Double(sourceExtent.width) * Double(sourceExtent.height)
+        let downScale: CGFloat = pixels > 12_600_000 ? CGFloat((12_600_000.0 / pixels).squareRoot()) : 1
+        let base = downScale < 1 ? scaled(decoded, by: downScale) : decoded
+
         var extent = base.extent
         var image = base
         var modified = false
@@ -45,10 +64,17 @@ final class PhotoProcessor {
             image = fit(blurred, to: extent).cropped(to: extent)
             modified = true
         }
+        // Un-graded linear gain (HDR / SDR) of the capture; nil when there is no usable HDR content.
+        var gain: CIImage?
+        if #available(iOS 18.0, *) {
+            gain = makeGain(data: data, sourceExtent: sourceExtent, downScale: downScale, base: base)
+        }
         if wantsCrop, let rect = cropRect(for: extent, aspect: gear.body.photoAspect) {
             // Crop first so the lens vignette etc. follow the final frame; move the origin back to zero.
-            image = image.cropped(to: rect)
-                .transformed(by: CGAffineTransform(translationX: -rect.minX, y: -rect.minY))
+            let move = CGAffineTransform(translationX: -rect.minX, y: -rect.minY)
+            image = image.cropped(to: rect).transformed(by: move)
+            // The gain gets exactly the same geometry as the SDR image.
+            gain = gain?.cropped(to: rect).transformed(by: move)
             extent = CGRect(x: 0, y: 0, width: rect.width, height: rect.height)
             modified = true
         }
@@ -59,10 +85,147 @@ final class PhotoProcessor {
         }
         guard modified else { return original }
 
-        let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
-        guard let cg = context.createCGImage(image, from: extent, format: .RGBA8, colorSpace: colorSpace),
-              let encoded = encode(cg, sourceData: data) else { return original }
-        return Output(data: encoded, thumbnail: LibrarySaver.photoThumbnail(from: encoded))
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+
+        // Metadata: keep the source EXIF/GPS, but describe the new upright, re-sized file.
+        var props: [String: Any] = sourceProps
+        props[kCGImagePropertyOrientation as String] = 1
+        var tiff = (props[kCGImagePropertyTIFFDictionary as String] as? [String: Any]) ?? [:]
+        tiff[kCGImagePropertyTIFFOrientation as String] = 1
+        props[kCGImagePropertyTIFFDictionary as String] = tiff
+        var exif = (props[kCGImagePropertyExifDictionary as String] as? [String: Any]) ?? [:]
+        exif[kCGImagePropertyExifPixelXDimension as String] = Int(extent.width)
+        exif[kCGImagePropertyExifPixelYDimension as String] = Int(extent.height)
+        // The old Apple HDR headroom must not describe the new gain map.
+        exif.removeValue(forKey: kCGImagePropertyExifCustomRendered as String)
+        props[kCGImagePropertyExifDictionary as String] = exif
+        props.removeValue(forKey: kCGImagePropertyMakerAppleDictionary as String)
+
+        let primary = image.cropped(to: extent).settingProperties(props as [AnyHashable: Any])
+        var options: [CIImageRepresentationOption: Any] = [
+            CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.92
+        ]
+        let sdrOptions = options
+        var hasHDR = false
+
+        // HDR: SDR primary + our own gain map (Core Image computes it from hdrImage). Portrait depth blur
+        // is SDR-only, so blurred backgrounds keep the capture's own gain.
+        if #available(iOS 18.0, *), let gain = gain {
+            let g = gain.cropped(to: extent)
+            if let avg = averageLuminance(g, on: context), avg > 1.01 {
+                let multiply = CIFilter.multiplyCompositing()
+                multiply.inputImage = image.cropped(to: extent)
+                multiply.backgroundImage = g
+                if let hdrGraded = multiply.outputImage?.cropped(to: extent) {
+                    options[.hdrImage] = hdrGraded
+                    hasHDR = true
+                }
+            }
+        }
+
+        var attempts: [(CIContext, [CIImageRepresentationOption: Any])] = [(context, options)]
+        attempts.append((softwareContext, options))
+        if hasHDR {
+            // Last resort: drop HDR but still apply the look.
+            attempts.append((context, sdrOptions))
+            attempts.append((softwareContext, sdrOptions))
+        }
+        for (ctx, opts) in attempts {
+            if let encoded = encodeImage(primary, colorSpace: p3, options: opts, context: ctx) {
+                return Output(data: encoded, thumbnail: LibrarySaver.photoThumbnail(from: encoded))
+            }
+            NSLog("LuxCam PhotoProcessor: encode (\(ctx === context ? "gpu" : "software"), hdr=\(hasHDR && opts.count > sdrOptions.count)) failed")
+        }
+        return fail("encode")
+    }
+
+    /// CPU renderer used only when the main context cannot encode.
+    private lazy var softwareContext = CIContext(options: [.useSoftwareRenderer: true,
+                                                           .cacheIntermediates: false])
+
+    private func encodeImage(_ primary: CIImage, colorSpace: CGColorSpace,
+                             options: [CIImageRepresentationOption: Any], context ctx: CIContext) -> Data? {
+        if let heif = ctx.heifRepresentation(of: primary, format: .RGBA8, colorSpace: colorSpace, options: options) {
+            return heif
+        }
+        return ctx.jpegRepresentation(of: primary, colorSpace: colorSpace, options: options)
+    }
+
+    private func scaled(_ image: CIImage, by scale: CGFloat) -> CIImage {
+        let e = image.extent
+        let f = CIFilter.lanczosScaleTransform()
+        f.inputImage = image
+        f.scale = Float(scale)
+        f.aspectRatio = 1
+        guard let out = f.outputImage else { return image }
+        let o = out.extent
+        return out.cropped(to: CGRect(x: o.minX, y: o.minY,
+                                      width: (e.width * scale).rounded(.down),
+                                      height: (e.height * scale).rounded(.down)))
+    }
+
+    /// Mean luminance of `image` (1x1 area average read back as float), nil on failure.
+    private func averageLuminance(_ image: CIImage, on ctx: CIContext) -> Float? {
+        let f = CIFilter.areaAverage()
+        f.inputImage = image
+        f.extent = image.extent
+        guard let out = f.outputImage else { return nil }
+        var px = [Float](repeating: 0, count: 4)
+        let bounds = out.extent
+        guard !bounds.isInfinite, !bounds.isEmpty else { return nil }
+        px.withUnsafeMutableBytes { raw in
+            guard let addr = raw.baseAddress else { return }
+            ctx.render(out, toBitmap: addr, rowBytes: 16,
+                       bounds: CGRect(x: bounds.minX, y: bounds.minY, width: 1, height: 1),
+                       format: .RGBAf, colorSpace: nil)
+        }
+        let y = 0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2]
+        return y.isFinite ? y : nil
+    }
+
+    /// Per-pixel HDR/SDR gain (clamped to 1...16) in the same pixel grid as `base`; nil if the capture has no
+    /// HDR rendition, its geometry differs, or anything fails (then the photo is saved as SDR).
+    @available(iOS 18.0, *)
+    private func makeGain(data: Data, sourceExtent: CGRect, downScale: CGFloat, base: CIImage) -> CIImage? {
+        guard var hdr = CIImage(data: data, options: [.expandToHDR: true, .applyOrientationProperty: true]),
+              hdr.extent == sourceExtent else { return nil }
+        if downScale < 1 { hdr = scaled(hdr, by: downScale) }
+        guard hdr.extent == base.extent else { return nil }
+
+        // A small bias keeps 0/0 and huge ratios out of the division in the shadows.
+        func biased(_ img: CIImage) -> CIImage {
+            let m = CIFilter.colorMatrix()
+            m.inputImage = img
+            m.rVector = CIVector(x: 1, y: 0, z: 0, w: 0)
+            m.gVector = CIVector(x: 0, y: 1, z: 0, w: 0)
+            m.bVector = CIVector(x: 0, y: 0, z: 1, w: 0)
+            m.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            m.biasVector = CIVector(x: 0.002, y: 0.002, z: 0.002, w: 0)
+            return (m.outputImage ?? img).cropped(to: img.extent)
+        }
+        let b = biased(base), h = biased(hdr)
+        func divide(_ numerator: CIImage, _ denominator: CIImage) -> CIImage? {
+            // divideBlendMode's operand order is not certain; the caller verifies it at runtime.
+            let f = CIFilter.divideBlendMode()
+            f.inputImage = numerator
+            f.backgroundImage = denominator
+            return f.outputImage?.cropped(to: base.extent)
+        }
+        guard let candidate = divide(b, h) else { return nil }
+        guard let avg = averageLuminance(candidate, on: context) else { return nil }
+        // Real gain (hdr / base) is >= 1 on average; otherwise the operands were swapped.
+        let ratio: CIImage
+        if avg < 1.0 {
+            guard let swapped = divide(h, b) else { return nil }
+            ratio = swapped
+        } else {
+            ratio = candidate
+        }
+        let clamp = CIFilter.colorClamp()
+        clamp.inputImage = ratio
+        clamp.minComponents = CIVector(x: 1, y: 1, z: 1, w: 1)
+        clamp.maxComponents = CIVector(x: 16, y: 16, z: 16, w: 1)
+        return clamp.outputImage?.cropped(to: base.extent)
     }
 
     /// Centred crop rectangle (integral, even sizes) giving `aspect` (landscape w/h; inverted for portrait
@@ -164,35 +327,5 @@ final class PhotoProcessor {
             .concatenating(CGAffineTransform(scaleX: target.width / e.width, y: target.height / e.height))
             .concatenating(CGAffineTransform(translationX: target.minX, y: target.minY))
         return image.transformed(by: t)
-    }
-
-    // MARK: Encoding
-
-    /// Encodes as HEIC (JPEG fallback), upright (orientation 1), keeping EXIF/GPS from the source.
-    private func encode(_ cg: CGImage, sourceData: Data) -> Data? {
-        var props: [CFString: Any] = [
-            kCGImageDestinationLossyCompressionQuality: 0.92,
-            kCGImagePropertyOrientation: 1
-        ]
-        if let src = CGImageSourceCreateWithData(sourceData as CFData, nil),
-           let meta = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
-            if var exif = meta[kCGImagePropertyExifDictionary] as? [CFString: Any] {
-                exif[kCGImagePropertyExifPixelXDimension] = cg.width
-                exif[kCGImagePropertyExifPixelYDimension] = cg.height
-                props[kCGImagePropertyExifDictionary] = exif
-            }
-            if let gps = meta[kCGImagePropertyGPSDictionary] { props[kCGImagePropertyGPSDictionary] = gps }
-            if var tiff = meta[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
-                tiff[kCGImagePropertyTIFFOrientation] = 1
-                props[kCGImagePropertyTIFFDictionary] = tiff
-            }
-        }
-        for type in ["public.heic", "public.jpeg"] {
-            let out = NSMutableData()
-            guard let dest = CGImageDestinationCreateWithData(out, type as CFString, 1, nil) else { continue }
-            CGImageDestinationAddImage(dest, cg, props as CFDictionary)
-            if CGImageDestinationFinalize(dest) { return out as Data }
-        }
-        return nil
     }
 }
