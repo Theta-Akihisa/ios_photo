@@ -48,7 +48,7 @@ struct CameraPreviewView: UIViewRepresentable {
         view.colorPixelFormat = .bgra8Unorm
         view.backgroundColor = .black
         view.isOpaque = true
-        (view.layer as? CAMetalLayer)?.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+        (view.layer as? CAMetalLayer)?.colorspace = previewOutputColorSpace
         view.delegate = context.coordinator
 
         let tap = UITapGestureRecognizer(target: context.coordinator,
@@ -88,7 +88,7 @@ struct CameraPreviewView: UIViewRepresentable {
             CIContext(mtlDevice: $0, options: [.cacheIntermediates: false])
         }
         private static let outputColorSpace: CGColorSpace =
-            CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+            previewOutputColorSpace
         var device: MTLDevice? { Self.sharedDevice }
         private var commandQueue: MTLCommandQueue? { Self.sharedQueue }
         private var ciContext: CIContext? { Self.sharedContext }
@@ -263,3 +263,9 @@ struct CameraPreviewView: UIViewRepresentable {
         }
     }
 }
+
+/// Display P3 (matches saved photos), falling back to sRGB, then DeviceRGB.
+private let previewOutputColorSpace: CGColorSpace =
+    CGColorSpace(name: CGColorSpace.displayP3)
+    ?? CGColorSpace(name: CGColorSpace.sRGB)
+    ?? CGColorSpaceCreateDeviceRGB()

@@ -85,7 +85,7 @@ extension LookRenderer {
             let f = CIFilter.sharpenLuminance()
             f.inputImage = out
             f.sharpness = min(lens.sharpness * 0.6, 2)
-            f.radius = Float(min(max(ext.width / 1200, 0.8), 8))
+            f.radius = Float(min(max(max(ext.width, ext.height) / 1600, 0.8), 8))
             out = (f.outputImage ?? out).cropped(to: ext)
         }
         if !cheap && lens.bloom > eps {
@@ -147,6 +147,7 @@ extension LookRenderer {
         // Grain size is normalised to a ~1600 px long side so preview and full-resolution photo look alike.
         let s = max(1, max(ext.width, ext.height) / 1600)
         n.inputImage = noise
+            .samplingNearest()
             .transformed(by: CGAffineTransform(scaleX: s, y: s))
             .transformed(by: CGAffineTransform(translationX: CGFloat.random(in: 0..<512),
                                                y: CGFloat.random(in: 0..<512)))
